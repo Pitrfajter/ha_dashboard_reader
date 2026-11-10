@@ -551,7 +551,6 @@ class ReadDraft(Tool):
             return {"filename": args["filename"], "offset": start,
                     "total_characters": len(content),
                     "sha256": hash_text(content),
-                    "original_sha256": original_sha256,
                     "chunk": content[start:end], "has_more": end < len(content),
                     "next_offset": end if end < len(content) else None}
         try:
