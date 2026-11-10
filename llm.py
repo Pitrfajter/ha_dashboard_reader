@@ -1450,7 +1450,7 @@ class ReadSystemPanel(Tool):
 # Explicitly staged system-dashboard changes. No arbitrary .storage writes.
 SYSTEM_CHANGE_CONFIRM = "APPLY_APPROVED_SYSTEM_CHANGE"
 SYSTEM_CHANGE_PREFIX = "system_change_"
-SYSTEM_CHANGE_FILENAME = re.compile(r"system_change_[A-Za-z0-9_-]{1,60}\\.json\\Z")
+SYSTEM_CHANGE_FILENAME = re.compile(r"system_change_[A-Za-z0-9_-]{1,60}\.json\Z")
 
 def _system_change_file(hass, filename):
     if not isinstance(filename, str) or not SYSTEM_CHANGE_FILENAME.fullmatch(filename):
@@ -1475,7 +1475,7 @@ class PrepareSystemChange(Tool):
     annotations = EXPORT_ANNOTATIONS
     parameters = vol.Schema({
         vol.Required("panel"): vol.In(("energy",)),
-        vol.Required("filename"): vol.Match(r"system_change_[A-Za-z0-9_-]{1,60}\\.json"),
+        vol.Required("filename"): vol.Match(r"system_change_[A-Za-z0-9_-]{1,60}\.json"),
         vol.Required("expected_config_sha256"): vol.Match(r"[0-9a-f]{64}"),
         vol.Required("configuration"): dict,
     })
@@ -1523,7 +1523,7 @@ class ApplySystemChange(Tool):
     integration = DOMAIN
     annotations = ToolAnnotations(read_only=False, destructive=True, idempotent=False, open_world=False)
     parameters = vol.Schema({
-        vol.Required("filename"): vol.Match(r"system_change_[A-Za-z0-9_-]{1,60}\\.json"),
+        vol.Required("filename"): vol.Match(r"system_change_[A-Za-z0-9_-]{1,60}\.json"),
         vol.Required("expected_draft_sha256"): vol.Match(r"[0-9a-f]{64}"),
         vol.Required("confirmation"): vol.In((SYSTEM_CHANGE_CONFIRM,)),
     })
@@ -1565,7 +1565,7 @@ class RestoreSystemBackup(Tool):
     integration = DOMAIN
     annotations = ToolAnnotations(read_only=False, destructive=True, idempotent=False, open_world=False)
     parameters = vol.Schema({
-        vol.Required("filename"): vol.Match(r"system_change_backup_[0-9]+\\.json"),
+        vol.Required("filename"): vol.Match(r"system_change_backup_[0-9]+\.json"),
         vol.Required("expected_current_sha256"): vol.Match(r"[0-9a-f]{64}"),
         vol.Required("confirmation"): vol.In((SYSTEM_CHANGE_CONFIRM,)),
     })
