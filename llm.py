@@ -2639,7 +2639,7 @@ class PrepareEntityRegistryCleanup(Tool):
     annotations = READ_ONLY
     parameters = vol.Schema({
         vol.Required("entity_ids"): vol.All(
-            [vol.All(str, vol.Match(r"^[a-z0-9_]+\\.[a-z0-9_]+$"))],
+            [vol.All(str, vol.Match(r"^[a-z0-9_]+\.[a-z0-9_]+$"))],
             vol.Length(min=1, max=20),
         ),
     })
