@@ -1628,7 +1628,7 @@ class ReadEnergyStatistics(Tool):
 
     async def async_call(self, hass, tool_input, llm_context):
         from datetime import datetime, timezone, timedelta
-        from homeassistant.components.recorder import statistics
+        from homeassistant.components.recorder import statistics, get_instance
         args = tool_input.tool_args
         try:
             start = args["start_time"]
@@ -1649,8 +1649,8 @@ class ReadEnergyStatistics(Tool):
                 raise ValueError("Requested interval too long")
             ids = list(dict.fromkeys(args["statistic_ids"]))
             # Official recorder statistics API supports non-entity statistic IDs.
-            values = await statistics.async_add_executor_job(
-                hass, statistics.statistics_during_period,
+            values = await get_instance(hass).async_add_executor_job(
+                statistics.statistics_during_period, hass,
                 start, end, ids, period, None, {"sum", "state", "change"})
             output = {}
             for statistic_id in ids:
