@@ -1446,13 +1446,174 @@ class ReadSystemPanel(Tool):
         except (ValueError, OSError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
             return ToolResult(data={"error": str(exc)}, error=True)
 
+
+# Explicitly staged system-dashboard changes. No arbitrary .storage writes.
+SYSTEM_CHANGE_CONFIRM = "APPLY_APPROVED_SYSTEM_CHANGE"
+SYSTEM_CHANGE_PREFIX = "system_change_"
+SYSTEM_CHANGE_FILENAME = re.compile(r"system_change_[A-Za-z0-9_-]{1,60}\\.json\\Z")
+
+def _system_change_file(hass, filename):
+    if not isinstance(filename, str) or not SYSTEM_CHANGE_FILENAME.fullmatch(filename):
+        raise ValueError("Invalid system change filename")
+    return draft_path(hass, filename)
+
+def _system_config_hash(value):
+    return hash_text(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+
+def _system_change_diff(before, after):
+    return {"before": sanitize(before), "after": sanitize(after)}
+
+class PrepareSystemChange(Tool):
+    name = "dashboard_reader__prepare_system_change"
+    title = "Stage system dashboard configuration change"
+    description = (
+        "Stage a complete replacement of Energy preferences in an isolated draft. "
+        "Read-only for live HA; requires exact current configuration SHA256 and "
+        "unique draft filename. Never edits history or live dashboards."
+    )
+    integration = DOMAIN
+    annotations = EXPORT_ANNOTATIONS
+    parameters = vol.Schema({
+        vol.Required("panel"): vol.In(("energy",)),
+        vol.Required("filename"): vol.Match(r"system_change_[A-Za-z0-9_-]{1,60}\\.json"),
+        vol.Required("expected_config_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("configuration"): dict,
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        try:
+            from homeassistant.components.energy.data import async_get_manager
+            manager = await async_get_manager(hass)
+            current = copy.deepcopy(manager.data or {})
+            current_hash = _system_config_hash(current)
+            if current_hash != args["expected_config_sha256"]:
+                raise ValueError("Energy configuration changed; reread before staging")
+            proposed = copy.deepcopy(args["configuration"])
+            allowed = {"energy_sources", "device_consumption", "device_consumption_water"}
+            if not proposed or set(proposed) - allowed:
+                raise ValueError("Only supported Energy preference fields are allowed")
+            if not isinstance(proposed.get("energy_sources", []), list):
+                raise ValueError("energy_sources must be a list")
+            if not isinstance(proposed.get("device_consumption", []), list):
+                raise ValueError("device_consumption must be a list")
+            if not isinstance(proposed.get("device_consumption_water", []), list):
+                raise ValueError("device_consumption_water must be a list")
+            # Merge partial preference update into a complete proposal for preview.
+            final = copy.deepcopy(current)
+            final.update(proposed)
+            payload = {"panel": "energy", "base_sha256": current_hash,
+                       "proposed": proposed, "preview": _system_change_diff(current, final)}
+            encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+            result = await hass.async_add_executor_job(
+                lambda: atomic_write_draft(hass, args["filename"], encoded, create_only=True))
+            return ToolResult(data={"draft": result, "preview": sanitize(payload["preview"]),
+                                    "requires_approval": True})
+        except (ValueError, OSError, TypeError, ImportError, json.JSONDecodeError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+class ApplySystemChange(Tool):
+    name = "dashboard_reader__apply_system_change"
+    title = "Apply explicitly approved Energy configuration"
+    description = (
+        "DANGEROUS: Apply staged Energy preferences using the official Energy manager. "
+        "Only after explicit approval for this exact draft. Checks current SHA256, "
+        "creates a backup draft, and never edits historical statistics."
+    )
+    integration = DOMAIN
+    annotations = ToolAnnotations(read_only=False, destructive=True, idempotent=False, open_world=False)
+    parameters = vol.Schema({
+        vol.Required("filename"): vol.Match(r"system_change_[A-Za-z0-9_-]{1,60}\\.json"),
+        vol.Required("expected_draft_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("confirmation"): vol.In((SYSTEM_CHANGE_CONFIRM,)),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        try:
+            raw = await hass.async_add_executor_job(read_draft_text, hass, args["filename"])
+            if hash_text(raw) != args["expected_draft_sha256"]:
+                raise ValueError("Draft SHA256 mismatch")
+            payload = json.loads(raw)
+            if payload.get("panel") != "energy" or not isinstance(payload.get("proposed"), dict):
+                raise ValueError("Invalid Energy change draft")
+            from homeassistant.components.energy.data import async_get_manager
+            manager = await async_get_manager(hass)
+            current = copy.deepcopy(manager.data or {})
+            if _system_config_hash(current) != payload.get("base_sha256"):
+                raise ValueError("Live Energy configuration changed; refusing to overwrite")
+            backup_name = "system_change_backup_" + str(time.time_ns()) + ".json"
+            # Backup uses the same isolated drafts directory.
+            backup = await hass.async_add_executor_job(
+                lambda: atomic_write_draft(hass, backup_name,
+                    json.dumps({"panel": "energy", "configuration": current},
+                               ensure_ascii=False, indent=2), create_only=True))
+            await manager.async_update(payload["proposed"])
+            return ToolResult(data={"applied": True, "panel": "energy",
+                                    "backup": backup, "new_sha256": _system_config_hash(manager.data or {}),
+                                    "note": "Energy configuration updated; history unchanged"})
+        except (ValueError, OSError, TypeError, ImportError, json.JSONDecodeError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+class RestoreSystemBackup(Tool):
+    name = "dashboard_reader__restore_system_backup"
+    title = "Restore approved Energy configuration backup"
+    description = (
+        "DANGEROUS: Restore Energy preferences from a backup created by apply_system_change. "
+        "Requires explicit approval and exact current SHA256."
+    )
+    integration = DOMAIN
+    annotations = ToolAnnotations(read_only=False, destructive=True, idempotent=False, open_world=False)
+    parameters = vol.Schema({
+        vol.Required("filename"): vol.Match(r"system_change_backup_[0-9]+\\.json"),
+        vol.Required("expected_current_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("confirmation"): vol.In((SYSTEM_CHANGE_CONFIRM,)),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        try:
+            raw = await hass.async_add_executor_job(read_draft_text, hass, args["filename"])
+            payload = json.loads(raw)
+            if payload.get("panel") != "energy" or not isinstance(payload.get("configuration"), dict):
+                raise ValueError("Invalid backup")
+            from homeassistant.components.energy.data import async_get_manager
+            manager = await async_get_manager(hass)
+            if _system_config_hash(manager.data or {}) != args["expected_current_sha256"]:
+                raise ValueError("Live Energy configuration changed; refusing restore")
+            await manager.async_update(payload["configuration"])
+            return ToolResult(data={"restored": True, "panel": "energy",
+                                    "new_sha256": _system_config_hash(manager.data or {})})
+        except (ValueError, OSError, TypeError, ImportError, json.JSONDecodeError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+class EnergyConfigStatus(Tool):
+    name = "dashboard_reader__energy_config_status"
+    title = "Read live Energy preferences and revision hash"
+    description = "Read current Energy manager preferences and SHA256, without changing anything."
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({})
+
+    async def async_call(self, hass, tool_input, llm_context):
+        try:
+            from homeassistant.components.energy.data import async_get_manager
+            manager = await async_get_manager(hass)
+            config = copy.deepcopy(manager.data or {})
+            return ToolResult(data=safe_result({
+                "panel": "energy", "configuration": config,
+                "sha256": _system_config_hash(config)}))
+        except (ValueError, OSError, ImportError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
     """Expose dashboard inspection and isolated draft tools."""
     return LLMTools(tools=[
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
-        ListSystemPanels(), ReadSystemPanel(),
+        ListSystemPanels(), ReadSystemPanel(), EnergyConfigStatus(),
+        PrepareSystemChange(), ApplySystemChange(), RestoreSystemBackup(),
         ExportCard(), ListExports(), ReadExport(),
         ListDrafts(), ReadDraft(), CreateCardDraft(), PatchCardDraft(),
         CreateTextDraft(), AppendTextDraft(), ReadHAConfig(),
