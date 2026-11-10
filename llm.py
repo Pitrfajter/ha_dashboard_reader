@@ -2420,7 +2420,7 @@ class EntityRegistryInspect(Tool):
     integration = DOMAIN
     annotations = READ_ONLY
     parameters = vol.Schema({
-        vol.Required("entity_id"): vol.All(str, vol.Match(r"^[a-z0-9_]+\\.[a-z0-9_]+$")),
+        vol.Required("entity_id"): vol.All(str, vol.Match(r"^[a-z0-9_]+\.[a-z0-9_]+$")),
     })
 
     async def async_call(self, hass, tool_input, llm_context):
