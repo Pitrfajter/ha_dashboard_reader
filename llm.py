@@ -1672,7 +1672,7 @@ FILE_MGR_EXT = {".py", ".json", ".yaml", ".yml", ".js", ".ts", ".css", ".html",
 FILE_MGR_BLOCKED = {".storage", ".git", ".ssh", "secrets.yaml", ".env",
                     "known_devices.yaml", "auth", "auth_provider.homeassistant",
                     "home-assistant_v2.db", "home-assistant_v2.db-shm",
-                    "home-assistant_v2.db-wal"}
+                    "home-assistant_v2.db-wal", "drafts", "file_backups", "backups", "exports"}
 FILE_MGR_LIMIT = 400_000
 FILE_MGR_CONFIRM = "APPLY_APPROVED_CONFIG_FILE_CHANGE"
 FILE_MGR_RESTORE = "RESTORE_APPROVED_CONFIG_FILE_BACKUP"
