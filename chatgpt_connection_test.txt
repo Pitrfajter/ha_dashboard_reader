@@ -1,0 +1,4 @@
+ChatGPT GitHub connection test
+Date: 2026-11-10
+Repository: Pitrfajter/ha_dashboard_reader
+This file was created to verify repository write access.
