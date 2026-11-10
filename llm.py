@@ -1706,8 +1706,8 @@ def _managed_redact(content):
     """Conservatively redact entire lines that appear to contain credentials."""
     out = []
     for line in content.splitlines(keepends=True):
-        if SECRET_KEYS.search(line) or re.search(r"(?i)authorization|bearer\\s|private.key|client.secret", line):
-            out.append("[REDACTED SENSITIVE LINE]\\n" if line.endswith("\\n") else "[REDACTED SENSITIVE LINE]")
+        if SECRET_KEYS.search(line) or re.search(r"(?i)authorization|bearer\s|private.key|client.secret", line):
+            out.append("[REDACTED SENSITIVE LINE]\n" if line.endswith("\n") else "[REDACTED SENSITIVE LINE]")
         else:
             out.append(redact_inline_secrets(line))
     return "".join(out)
