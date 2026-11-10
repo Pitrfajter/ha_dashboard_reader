@@ -2625,6 +2625,96 @@ class EntityRegistryAudit(Tool):
         })
 
 
+
+class PrepareEntityRegistryCleanup(Tool):
+    """Read-only safety check for a fixed, explicit list of entity IDs."""
+    name = "dashboard_reader__prepare_entity_registry_cleanup"
+    title = "Prepare safe entity registry cleanup"
+    description = (
+        "Read-only preflight for up to 20 explicit entity IDs. Checks registry "
+        "unique IDs, live objects, restored states and known config entry status. "
+        "Never deletes, disables or modifies entities."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Required("entity_ids"): vol.All(
+            [vol.All(str, vol.Match(r"^[a-z0-9_]+\\.[a-z0-9_]+$"))],
+            vol.Length(min=1, max=20),
+        ),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        from homeassistant.helpers import entity_registry as er
+        from homeassistant.helpers import entity_platform as ep
+
+        ids = tool_input.tool_args["entity_ids"]
+        if len(ids) != len(set(ids)):
+            return ToolResult(data={"error": "Duplicate entity IDs", "read_only": True})
+        registry = er.async_get(hass)
+        results = []
+        for entity_id in ids:
+            entry = registry.async_get(entity_id)
+            state = hass.states.get(entity_id)
+            if entry is None:
+                results.append({
+                    "entity_id": entity_id, "registered": False,
+                    "eligible_for_review": False, "reason": "Not registered",
+                })
+                continue
+            try:
+                platforms = ep.async_get_platforms(hass, entry.platform)
+                loaded = any(
+                    entity_id in platform.entities or any(
+                        getattr(obj, "entity_id", None) == entity_id
+                        for obj in platform.entities.values()
+                    )
+                    for platform in platforms
+                )
+                runtime_error = None
+            except Exception as exc:
+                loaded = None
+                runtime_error = type(exc).__name__
+            restored = bool(
+                state.attributes.get("restored", False)
+                if state is not None else False
+            )
+            candidate = (
+                loaded is False and restored
+                and state is not None and state.state == "unavailable"
+                and entry.disabled_by is None
+                and runtime_error is None
+            )
+            results.append({
+                "entity_id": entity_id,
+                "registered": True,
+                "platform": entry.platform,
+                "unique_id": entry.unique_id,
+                "config_entry_id": entry.config_entry_id,
+                "state": state.state if state is not None else None,
+                "restored": restored,
+                "runtime_entity_loaded": loaded,
+                "runtime_check_error": runtime_error,
+                "disabled_by": str(entry.disabled_by) if entry.disabled_by else None,
+                "eligible_for_review": candidate,
+                "reason": (
+                    "Candidate only; dependencies and history require separate verification"
+                    if candidate else "Does not meet conservative orphan criteria"
+                ),
+            })
+        return ToolResult(data={
+            "read_only": True,
+            "requested": len(ids),
+            "candidates": sum(x["eligible_for_review"] for x in results),
+            "all_candidates": all(x["eligible_for_review"] for x in results),
+            "entries": results,
+            "next_step": (
+                "Manual review and verified backup before any registry removal; "
+                "this tool never authorizes deletion."
+            ),
+        })
+
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
@@ -2634,7 +2724,7 @@ def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
         PrepareLovelaceCardAdd(), ApplyLovelaceCardAdd(),
         PrepareLovelaceCardDelete(), ApplyLovelaceCardDelete(),
         PrepareLovelaceCardMove(), ApplyLovelaceCardMove(),
-        EntityRegistryInspect(), EntityRegistryAudit(),
+        EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(),
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
         ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(),
         PrepareConfigFileChange(), ApplyConfigFileChange(), RestoreConfigFileBackup(),
