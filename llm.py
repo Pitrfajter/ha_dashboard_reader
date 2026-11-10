@@ -2408,50 +2408,79 @@ class RestoreLovelaceCardBackup(Tool):
 
 
 class EntityRegistryInspect(Tool):
-    """Inspect one entity registry entry using Home Assistant's supported API."""
+    """Read-only registry inspection including live platform membership."""
     name = "dashboard_reader__entity_registry_inspect"
-    title = "Inspect Home Assistant entity registry entry"
+    title = "Inspect Home Assistant entity registry entry and runtime"
     description = (
-        "Read-only inspection of a single entity_id in Home Assistant's entity "
-        "registry. Reports registry metadata and live state, without changing entities."
+        "Read-only inspection of one entity: registry unique_id, platform, "
+        "config-entry status, current state and whether the entity object is "
+        "currently loaded on an HA entity platform. A missing runtime object "
+        "is a candidate orphan, not proof that it is safe to delete."
     )
     integration = DOMAIN
     annotations = READ_ONLY
     parameters = vol.Schema({
-        vol.Required("entity_id"): vol.All(str, vol.Match(r"^[a-z0-9_]+\.[a-z0-9_]+$")),
+        vol.Required("entity_id"): vol.All(str, vol.Match(r"^[a-z0-9_]+\\.[a-z0-9_]+$")),
     })
 
     async def async_call(self, hass, tool_input, llm_context):
         from homeassistant.helpers import entity_registry as er
+        from homeassistant.helpers import entity_platform as ep
 
         entity_id = tool_input.tool_args["entity_id"]
+        domain = entity_id.split(".", 1)[0]
         registry = er.async_get(hass)
         entry = registry.async_get(entity_id)
         state = hass.states.get(entity_id)
-        if entry is None:
-            return ToolResult(data={
-                "entity_id": entity_id,
-                "registered": False,
-                "state_exists": state is not None,
-                "state": state.state if state is not None else None,
-                "restored": bool(state.attributes.get("restored", False)) if state is not None else False,
-            })
-        return ToolResult(data={
+
+        runtime_loaded = None
+        runtime_check_error = None
+        try:
+            platforms = ep.async_get_platforms(hass, domain)
+            runtime_loaded = any(
+                entity_id in platform.entities for platform in platforms
+            )
+        except Exception as exc:
+            runtime_check_error = type(exc).__name__
+
+        result = {
             "entity_id": entity_id,
-            "registered": True,
-            "domain": entity_id.split(".", 1)[0],
-            "platform": entry.platform,
-            "disabled_by": str(entry.disabled_by) if entry.disabled_by is not None else None,
-            "hidden_by": str(entry.hidden_by) if entry.hidden_by is not None else None,
-            "name": entry.name,
-            "original_name": entry.original_name,
-            "device_id": entry.device_id,
-            "config_entry_id": entry.config_entry_id,
+            "registered": entry is not None,
             "state_exists": state is not None,
             "state": state.state if state is not None else None,
             "restored": bool(state.attributes.get("restored", False)) if state is not None else False,
-        })
-
+            "runtime_entity_loaded": runtime_loaded,
+            "runtime_check_error": runtime_check_error,
+            "read_only": True,
+        }
+        if entry is not None:
+            config_entry = (
+                hass.config_entries.async_get_entry(entry.config_entry_id)
+                if entry.config_entry_id else None
+            )
+            result.update({
+                "domain": domain,
+                "platform": entry.platform,
+                "unique_id": entry.unique_id,
+                "disabled_by": str(entry.disabled_by) if entry.disabled_by is not None else None,
+                "hidden_by": str(entry.hidden_by) if entry.hidden_by is not None else None,
+                "name": entry.name,
+                "original_name": entry.original_name,
+                "device_id": entry.device_id,
+                "config_entry_id": entry.config_entry_id,
+                "config_entry_state": (
+                    str(config_entry.state.value)
+                    if config_entry is not None else None
+                ),
+                "orphan_candidate": (
+                    runtime_loaded is False and entry.disabled_by is None
+                ),
+                "orphan_candidate_note": (
+                    "Missing loaded runtime entity may be expected for conditional "
+                    "entities; verify source code and dependencies before deletion."
+                ),
+            })
+        return ToolResult(data=result)
 
 
 class EntityRegistryAudit(Tool):
