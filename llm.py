@@ -2455,14 +2455,15 @@ class EntityRegistryInspect(Tool):
 
 
 class EntityRegistryAudit(Tool):
-    """Report potentially unhealthy registry entries without modifying HA."""
+    """Read-only health audit of one domain or the whole HA entity registry."""
     name = "dashboard_reader__entity_registry_audit"
-    title = "Audit entity registry health"
+    title = "Audit entity registry and current states"
     description = (
-        "Read-only scan of Home Assistant's entity registry. Filter by domain or "
-        "entity ID prefix; report missing states, restored states, disabled entries "
-        "and possible duplicate-name suffixes. Findings are diagnostic hints, "
-        "not proof of orphaned or broken entities."
+        "Read-only audit of a domain (default input_number) or domain='all'. "
+        "Reports missing, unavailable, unknown, restored and disabled entities, "
+        "possible numeric-suffix ID collisions, and state-only entities. "
+        "Provides per-domain counts and bounded findings; no changes to HA. "
+        "Unavailable/unknown are current snapshots, not duration measurements."
     )
     integration = DOMAIN
     annotations = READ_ONLY
@@ -2484,54 +2485,102 @@ class EntityRegistryAudit(Tool):
         prefix = args.get("prefix", "")
         limit = args.get("limit", 100)
         registry = er.async_get(hass)
-        matching = sorted(
-            (entry for entry in registry.entities.values()
-             if entry.entity_id.startswith(domain + ".")
-             and entry.entity_id.startswith(prefix)),
-            key=lambda entry: entry.entity_id,
-        )
+        entries = registry.entities
+        live_states = {state.entity_id: state for state in hass.states.async_all()}
+
+        def selected(entity_id):
+            return (domain == "all" or entity_id.startswith(domain + ".")) and (
+                not prefix or entity_id.startswith(prefix))
+
+        categories = ("missing_state", "unavailable", "unknown", "restored",
+                      "disabled", "possible_suffix_conflict", "state_only")
+        totals = dict.fromkeys(categories, 0)
+        by_domain = {}
         findings = []
-        counts = {"missing_state": 0, "restored": 0,
-                  "disabled": 0, "possible_suffix_conflict": 0}
-        for entry in matching:
-            state = hass.states.get(entry.entity_id)
+        affected = 0
+        registered = 0
+        state_only = 0
+
+        def record(entity_id, platform, state, disabled_by, issues):
+            nonlocal affected
+            item_domain = entity_id.split(".", 1)[0]
+            summary = by_domain.setdefault(item_domain, {
+                "registered": 0, "state_only": 0,
+                "issue_counts": dict.fromkeys(categories, 0),
+            })
+            if platform is None:
+                summary["state_only"] += 1
+            else:
+                summary["registered"] += 1
+            for issue in issues:
+                totals[issue] += 1
+                summary["issue_counts"][issue] += 1
+            if issues:
+                affected += 1
+                if len(findings) < limit:
+                    findings.append({
+                        "entity_id": entity_id,
+                        "platform": platform,
+                        "issues": issues,
+                        "state": state.state if state is not None else None,
+                        "disabled_by": str(disabled_by)
+                        if disabled_by is not None else None,
+                    })
+
+        for entry in sorted(entries.values(), key=lambda item: item.entity_id):
+            entity_id = entry.entity_id
+            if not selected(entity_id):
+                continue
+            registered += 1
+            state = live_states.get(entity_id)
             issues = []
             if entry.disabled_by is not None:
                 issues.append("disabled")
             elif state is None:
                 issues.append("missing_state")
-            if state is not None and state.attributes.get("restored") is True:
-                issues.append("restored")
-            # A numbered suffix can be normal; it is only a review hint.
-            match = re.search(r"_(\\d+)$", entry.entity_id)
-            if match and registry.async_get(entry.entity_id[:match.start()]) is not None:
+            if state is not None:
+                if state.state == "unavailable":
+                    issues.append("unavailable")
+                elif state.state == "unknown":
+                    issues.append("unknown")
+                if state.attributes.get("restored") is True:
+                    issues.append("restored")
+            match = re.search(r"_(\\d+)$", entity_id)
+            if match and entries.get(entity_id[:match.start()]) is not None:
                 issues.append("possible_suffix_conflict")
-            for issue in issues:
-                counts[issue] += 1
-            if issues and len(findings) < limit:
-                findings.append({
-                    "entity_id": entry.entity_id,
-                    "platform": entry.platform,
-                    "issues": issues,
-                    "state": state.state if state is not None else None,
-                    "disabled_by": str(entry.disabled_by)
-                    if entry.disabled_by is not None else None,
-                })
+            record(entity_id, entry.platform, state, entry.disabled_by, issues)
+
+        # Not every HA state belongs to the entity registry (e.g. YAML entities).
+        for entity_id in sorted(live_states):
+            if not selected(entity_id) or entity_id in entries:
+                continue
+            state_only += 1
+            state = live_states[entity_id]
+            issues = ["state_only"]
+            if state.state in ("unavailable", "unknown"):
+                issues.append(state.state)
+            if state.attributes.get("restored") is True:
+                issues.append("restored")
+            record(entity_id, None, state, None, issues)
+
         return ToolResult(data={
             "domain": domain,
             "prefix": prefix,
-            "scanned": len(matching),
-            "issue_counts": counts,
+            "registered_scanned": registered,
+            "state_only_scanned": state_only,
+            "scanned": registered + state_only,
+            "affected_entities": affected,
+            "issue_counts": totals,
+            "by_domain": dict(sorted(by_domain.items())),
             "findings": findings,
-            "findings_truncated": sum(1 for entry in matching
-                if (entry.disabled_by is not None
-                    or (entry.disabled_by is None and hass.states.get(entry.entity_id) is None)
-                    or (hass.states.get(entry.entity_id) is not None
-                        and hass.states.get(entry.entity_id).attributes.get("restored") is True)
-                    or (re.search(r"_(\\d+)$", entry.entity_id) is not None
-                        and registry.async_get(re.sub(r"_\\d+$", "", entry.entity_id)) is not None)))
-                > len(findings),
+            "findings_truncated": affected > len(findings),
             "read_only": True,
+            "notes": [
+                "State-only entities may be normal; not necessarily orphaned.",
+                "Disabled entries are not counted as missing_state.",
+                "Numeric suffixes are only possible naming collisions.",
+                "Unavailable and unknown describe the current snapshot, not history.",
+            ],
         })
 
 
