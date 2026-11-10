@@ -34,6 +34,10 @@ def storage(hass, name):
     url_path = name.removeprefix("lovelace.")
     dashboards = getattr(manager, "dashboards", {})
     dashboard = dashboards.get(url_path)
+    if dashboard is None:
+        dashboard = next((d for d in dashboards.values()
+                          if isinstance(getattr(d, "config", None), dict)
+                          and d.config.get("id") == url_path), None)
     if dashboard is None or not hasattr(dashboard, "async_save"):
         raise ValueError("Dashboard is not available through the Lovelace storage API")
     if dashboard.__class__.__name__ != "LovelaceStorage":
