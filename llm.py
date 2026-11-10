@@ -3011,6 +3011,123 @@ class VerifyEntityRegistryDeletionPlan(Tool):
         })
 
 
+
+class ApplyBoschRegistryCleanup(Tool):
+    """Delete only the seven explicitly reviewed orphan registry entries."""
+    name = "dashboard_reader__apply_bosch_registry_cleanup"
+    title = "Apply approved Bosch registry cleanup"
+    description = (
+        "DESTRUCTIVE. Removes exactly seven reviewed Bosch HomeCom entity-registry "
+        "entries, not recorder history. Requires exact plan hash, explicit approval "
+        "and full-backup acknowledgement. Refuses changed or active entries."
+    )
+    integration = DOMAIN
+    annotations = ToolAnnotations(
+        read_only=False, destructive=True, idempotent=False, open_world=False
+    )
+    parameters = vol.Schema({
+        vol.Required("filename"): vol.Match(r"^registry_plan_[0-9a-f]{16}\.json$"),
+        vol.Required("expected_sha256"): vol.Match(r"^[0-9a-f]{64}$"),
+        vol.Required("full_backup_confirmed"): vol.In([True]),
+        vol.Required("confirmation"): vol.In(["DELETE_APPROVED_SEVEN_BOSCH_REGISTRY_ENTRIES"]),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        from homeassistant.helpers import entity_registry as er
+        from homeassistant.helpers import entity_platform as ep
+
+        args = tool_input.tool_args
+        expected = {
+            "binary_sensor.kotlownia_bosch_piec_gazowy_central_heating_active": "102066859-hs_ch_status",
+            "binary_sensor.kotlownia_bosch_piec_gazowy_emergency_mode": "102066859-hs_emergency_mode",
+            "binary_sensor.kotlownia_bosch_piec_gazowy_standby_mode": "102066859-hs_standby_mode",
+            "binary_sensor.kotlownia_bosch_piec_gazowy_thermal_disinfection": "102066859-local_thermal_disinfection",
+            "sensor.kotlownia_bosch_piec_gazowy_burner_gas_energy_lifetime_total": "102066859-lifetime_burner_total",
+            "sensor.kotlownia_bosch_piec_gazowy_hot_water_current_setpoint": "102066859-local_dhw_current_setpoint",
+            "sensor.kotlownia_bosch_piec_gazowy_supply_temperature_setpoint": "102066859-local_supply_setpoint",
+        }
+        folder = Path(hass.config.config_dir) / "dashboard_reader" / "backups"
+        path = folder / args["filename"]
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 200000:
+            return ToolResult(data={"deleted": [], "error": "Unsafe or missing plan"})
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if (digest != args["expected_sha256"]
+                or args["filename"] != "registry_plan_" + digest[:16] + ".json"):
+            return ToolResult(data={"deleted": [], "error": "Plan hash mismatch"})
+        try:
+            plan = json.loads(raw)
+        except (ValueError, UnicodeError):
+            return ToolResult(data={"deleted": [], "error": "Invalid plan"})
+        items = plan.get("entities")
+        if (plan.get("schema_version") != 1
+                or plan.get("purpose") != "registry_entry_cleanup_review_only"
+                or plan.get("registry_mutated") is not False
+                or plan.get("history_preservation_required") is not True
+                or not isinstance(items, list) or len(items) != 7
+                or plan.get("entity_count") != 7
+                or {x.get("entity_id"): x.get("unique_id") for x in items} != expected):
+            return ToolResult(data={"deleted": [], "error": "Unexpected plan contents"})
+        registry = er.async_get(hass)
+        blockers = []
+        for item in items:
+            entity_id = item["entity_id"]
+            entry = registry.async_get(entity_id)
+            state = hass.states.get(entity_id)
+            if (entry is None or entry.unique_id != item["unique_id"]
+                    or entry.platform != "bosch_homecom"
+                    or entry.platform != item["platform"]
+                    or entry.config_entry_id != item["config_entry_id"]
+                    or entry.device_id != item["device_id"]):
+                blockers.append({"entity_id": entity_id, "reason": "registry_changed"})
+                continue
+            if (state is None or state.state != "unavailable"
+                    or state.attributes.get("restored") is not True):
+                blockers.append({"entity_id": entity_id, "reason": "state_changed"})
+            try:
+                platforms = ep.async_get_platforms(hass, entry.platform)
+                if any(entity_id in p.entities or any(
+                    getattr(obj, "entity_id", None) == entity_id
+                    for obj in p.entities.values()
+                ) for p in platforms):
+                    blockers.append({"entity_id": entity_id, "reason": "runtime_loaded"})
+            except Exception:
+                blockers.append({"entity_id": entity_id, "reason": "runtime_check_failed"})
+        if blockers:
+            return ToolResult(data={"deleted": [], "blockers": blockers})
+        # Durable audit log must exist before the first registry mutation.
+        audit = folder / ("registry_cleanup_audit_" + digest[:16] + ".json")
+        if audit.exists() or audit.is_symlink():
+            return ToolResult(data={"deleted": [], "error": "Plan already attempted"})
+        record = {
+            "plan_sha256": digest, "created_at": time.time(),
+            "backup_confirmed_by_user": True,
+            "entities": items, "operation": "entity_registry_only",
+            "recorder_purge_requested": False, "status": "started",
+        }
+        fd = os.open(str(audit), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(record, output, ensure_ascii=False, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        deleted = []
+        try:
+            for item in items:
+                registry.async_remove(item["entity_id"])
+                deleted.append(item["entity_id"])
+        except Exception as exc:
+            return ToolResult(data={
+                "deleted": deleted, "error": type(exc).__name__,
+                "partial_failure": True, "audit_file": audit.name,
+                "recovery": "Use the full Home Assistant backup; do not retry blindly.",
+            })
+        return ToolResult(data={
+            "deleted": deleted, "count": len(deleted),
+            "audit_file": audit.name, "recorder_purge_requested": False,
+            "warning": "History was not explicitly purged; verify recorder retention separately.",
+        })
+
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
@@ -3020,7 +3137,7 @@ def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
         PrepareLovelaceCardAdd(), ApplyLovelaceCardAdd(),
         PrepareLovelaceCardDelete(), ApplyLovelaceCardDelete(),
         PrepareLovelaceCardMove(), ApplyLovelaceCardMove(),
-        EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(), EntityRegistryCleanupSafetyAudit(), PrepareEntityRegistryDeletionPlan(), VerifyEntityRegistryDeletionPlan(),
+        EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(), EntityRegistryCleanupSafetyAudit(), PrepareEntityRegistryDeletionPlan(), VerifyEntityRegistryDeletionPlan(), ApplyBoschRegistryCleanup(),
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
         ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(),
         PrepareConfigFileChange(), ApplyConfigFileChange(), RestoreConfigFileBackup(),
