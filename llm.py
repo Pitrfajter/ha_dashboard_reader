@@ -1606,13 +1606,72 @@ class EnergyConfigStatus(Tool):
         except (ValueError, OSError, ImportError) as exc:
             return ToolResult(data={"error": str(exc)}, error=True)
 
+
+class ReadEnergyStatistics(Tool):
+    name = "dashboard_reader__read_energy_statistics"
+    title = "Read Home Assistant long-term energy statistics"
+    description = (
+        "Read-only long-term statistics by statistic_id, including external IDs "
+        "such as tauron_importer:... . Returns bounded hourly or daily changes "
+        "and recorded totals, without changing recorder data."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Required("statistic_ids"): vol.All(
+            [vol.All(str, vol.Length(min=1, max=255))],
+            vol.Length(min=1, max=8)),
+        vol.Required("start_time"): vol.Datetime(),
+        vol.Required("end_time"): vol.Datetime(),
+        vol.Optional("period", default="day"): vol.In(("hour", "day", "month")),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        from datetime import datetime, timezone, timedelta
+        from homeassistant.components.recorder import statistics
+        args = tool_input.tool_args
+        try:
+            start = args["start_time"]
+            end = args["end_time"]
+            if isinstance(start, str):
+                start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            if isinstance(end, str):
+                end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            if start.tzinfo is None or end.tzinfo is None:
+                raise ValueError("Use timezone-aware ISO 8601 datetimes")
+            start = start.astimezone(timezone.utc)
+            end = end.astimezone(timezone.utc)
+            if end <= start or end > datetime.now(timezone.utc) + timedelta(minutes=5):
+                raise ValueError("Invalid time range")
+            period = args.get("period", "day")
+            max_days = {"hour": 7, "day": 90, "month": 730}[period]
+            if end - start > timedelta(days=max_days):
+                raise ValueError("Requested interval too long")
+            ids = list(dict.fromkeys(args["statistic_ids"]))
+            # Official recorder statistics API supports non-entity statistic IDs.
+            values = await statistics.async_add_executor_job(
+                hass, statistics.statistics_during_period,
+                start, end, ids, period, None, {"sum", "state", "change"})
+            output = {}
+            for statistic_id in ids:
+                rows = values.get(statistic_id, [])
+                output[statistic_id] = [
+                    {"start": row["start"].isoformat() if hasattr(row.get("start"), "isoformat") else row.get("start"),
+                     "end": row["end"].isoformat() if hasattr(row.get("end"), "isoformat") else row.get("end"),
+                     "sum": row.get("sum"), "state": row.get("state"), "change": row.get("change")}
+                    for row in rows[:2200]
+                ]
+            return ToolResult(data=safe_result({"period": period, "statistics": output}))
+        except (ValueError, TypeError, KeyError, ImportError, AttributeError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
     """Expose dashboard inspection and isolated draft tools."""
     return LLMTools(tools=[
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
-        ListSystemPanels(), ReadSystemPanel(), EnergyConfigStatus(),
+        ListSystemPanels(), ReadSystemPanel(), EnergyConfigStatus(), ReadEnergyStatistics(),
         PrepareSystemChange(), ApplySystemChange(), RestoreSystemBackup(),
         ExportCard(), ListExports(), ReadExport(),
         ListDrafts(), ReadDraft(), CreateCardDraft(), PatchCardDraft(),
