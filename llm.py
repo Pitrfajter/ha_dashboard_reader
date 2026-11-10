@@ -1985,7 +1985,9 @@ class RestoreConfigFileBackup(Tool):
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
     """Expose dashboard inspection and isolated draft tools."""
+    from .lovelace_edit import (PrepareLovelaceCardChange, ApplyLovelaceCardChange, RestoreLovelaceCardBackup)
     return LLMTools(tools=[
+        PrepareLovelaceCardChange(), ApplyLovelaceCardChange(), RestoreLovelaceCardBackup(),
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
         ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(),
         PrepareConfigFileChange(), ApplyConfigFileChange(), RestoreConfigFileBackup(),
