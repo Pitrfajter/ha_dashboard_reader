@@ -1345,12 +1345,114 @@ class RestartHomeAssistant(Tool):
             return ToolResult(data={"error": str(exc)}, error=True)
 
 
+
+# System panels are not all Lovelace dashboards. Read only explicitly approved
+# configuration stores; never expose arbitrary .storage entries.
+SYSTEM_PANEL_STORES = {
+    "energy": "energy",
+    "lovelace_default": "lovelace",
+    "lovelace_dashboards": "lovelace_dashboards",
+}
+SYSTEM_PANEL_INFO = {
+    "energy": "Energy dashboard configuration (sources, tariffs and costs)",
+    "lovelace_default": "Built-in Overview Lovelace configuration, if stored",
+    "lovelace_dashboards": "Registered Lovelace dashboard metadata",
+    "map": "Dynamic panel; no standalone stored dashboard configuration",
+    "history": "Dynamic panel; uses recorder history rather than a dashboard file",
+    "logbook": "Dynamic panel; uses recorded events rather than a dashboard file",
+    "statistics": "Dynamic diagnostics; use recorder statistics APIs",
+}
+
+def _read_system_panel(hass, panel):
+    if panel not in SYSTEM_PANEL_STORES:
+        raise ValueError("This system panel has no supported stored configuration")
+    root = Path(hass.config.config_dir) / ".storage"
+    if root.is_symlink():
+        raise ValueError("Storage directory cannot be a symlink")
+    path = root / SYSTEM_PANEL_STORES[panel]
+    if path.is_symlink() or not path.is_file():
+        return {"panel": panel, "available": False, "reason": "No stored configuration"}
+    if path.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError("Stored configuration exceeds size limit")
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("Invalid system panel configuration")
+    # Only return the payload, never storage metadata or unrelated files.
+    return {"panel": panel, "available": True,
+            "configuration": sanitize(value.get("data", {}))}
+
+class ListSystemPanels(Tool):
+    name = "dashboard_reader__list_system_panels"
+    title = "List supported Home Assistant system panels"
+    description = "List built-in panels and indicate which configurations can be inspected. Read-only."
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({})
+
+    async def async_call(self, hass, tool_input, llm_context):
+        def run():
+            result = []
+            for panel, description in SYSTEM_PANEL_INFO.items():
+                stored = panel in SYSTEM_PANEL_STORES
+                if stored:
+                    root = Path(hass.config.config_dir) / ".storage"
+                    path = root / SYSTEM_PANEL_STORES[panel]
+                    available = (not root.is_symlink() and not path.is_symlink()
+                                 and path.is_file())
+                else:
+                    available = False
+                result.append({"panel": panel, "description": description,
+                               "stored_config_available": available,
+                               "dynamic_panel": not stored})
+            return {"panels": result}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+class ReadSystemPanel(Tool):
+    name = "dashboard_reader__read_system_panel"
+    title = "Read built-in system panel configuration"
+    description = (
+        "Read-only, redacted inspection of allowlisted Home Assistant system panel "
+        "configuration: energy, lovelace_default or lovelace_dashboards. "
+        "Never changes stored files. For long results use offset and limit."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Required("panel"): vol.In(tuple(SYSTEM_PANEL_STORES)),
+        vol.Optional("offset", default=0): vol.All(int, vol.Range(min=0)),
+        vol.Optional("limit", default=8000): vol.All(int, vol.Range(min=1, max=CHUNK_LIMIT)),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        def run():
+            result = _read_system_panel(hass, args["panel"])
+            encoded = json.dumps(result, ensure_ascii=False, indent=2)
+            if len(encoded) > MAX_RESPONSE_CHARS:
+                raise ValueError("Response exceeds size limit")
+            start = args["offset"]
+            end = min(start + args["limit"], len(encoded))
+            return {"panel": args["panel"], "offset": start,
+                    "total_characters": len(encoded), "chunk": encoded[start:end],
+                    "sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                    "has_more": end < len(encoded),
+                    "next_offset": end if end < len(encoded) else None}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
     """Expose dashboard inspection and isolated draft tools."""
     return LLMTools(tools=[
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
+        ListSystemPanels(), ReadSystemPanel(),
         ExportCard(), ListExports(), ReadExport(),
         ListDrafts(), ReadDraft(), CreateCardDraft(), PatchCardDraft(),
         CreateTextDraft(), AppendTextDraft(), ReadHAConfig(),
