@@ -1315,6 +1315,37 @@ class InstallHADraftFile(Tool):
             return ToolResult(data={"error": str(exc)}, error=True)
 
 
+RESTART_CONFIRM = "RESTART_HOME_ASSISTANT_APPROVED"
+
+
+class RestartHomeAssistant(Tool):
+    name = "dashboard_reader__restart_home_assistant"
+    description = (
+        "DANGEROUS: Restart Home Assistant Core. Use only when the user explicitly "
+        "approves a restart. Requires exact confirmation RESTART_HOME_ASSISTANT_APPROVED. "
+        "May interrupt automations, connected devices and this tool session."
+    )
+    integration = DOMAIN
+    annotations = ToolAnnotations(read_only=False, destructive=True, idempotent=False, open_world=False)
+    parameters = vol.Schema({
+        vol.Required("confirmation"): vol.In((RESTART_CONFIRM,)),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        if tool_input.tool_args["confirmation"] != RESTART_CONFIRM:
+            return ToolResult(data={"error": "Explicit restart confirmation required"}, error=True)
+        try:
+            await hass.services.async_call(
+                "homeassistant", "restart", {}, blocking=False
+            )
+            return ToolResult(data={
+                "restart_requested": True,
+                "note": "Restart requested; connection may drop before completion",
+            })
+        except Exception as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
@@ -1325,5 +1356,5 @@ def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
         ListDrafts(), ReadDraft(), CreateCardDraft(), PatchCardDraft(),
         CreateTextDraft(), AppendTextDraft(), ReadHAConfig(),
         LLMUpdateStatus(), StageLLMUpdate(), FetchLLMUpdate(), ApplyLLMUpdate(), RestoreLLMBackup(),
-        AppendScriptFromDraft(), HAFileStatus(), InstallHADraftFile(),
+        AppendScriptFromDraft(), HAFileStatus(), InstallHADraftFile(), RestartHomeAssistant(),
     ])
