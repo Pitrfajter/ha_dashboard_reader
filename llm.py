@@ -2815,6 +2815,120 @@ class EntityRegistryCleanupSafetyAudit(Tool):
         })
 
 
+
+class PrepareEntityRegistryDeletionPlan(Tool):
+    """Persist a reviewed, read-only deletion plan without deleting entities."""
+    name = "dashboard_reader__prepare_entity_registry_deletion_plan"
+    title = "Prepare entity registry deletion plan"
+    description = (
+        "Read-only with respect to Home Assistant registry and recorder. "
+        "Creates a JSON snapshot of exact entity registry metadata and a "
+        "deletion plan in the dashboard_reader backup folder. Refuses active "
+        "entities and requires exact expected unique IDs. Does not delete."
+    )
+    integration = DOMAIN
+    annotations = EXPORT_ANNOTATIONS
+    parameters = vol.Schema({
+        vol.Required("entities"): vol.All(
+            [vol.Schema({
+                vol.Required("entity_id"): vol.All(
+                    str, vol.Match(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+                ),
+                vol.Required("unique_id"): vol.All(
+                    str, vol.Length(min=1, max=255)
+                ),
+            })],
+            vol.Length(min=1, max=20),
+        ),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        from homeassistant.helpers import entity_registry as er
+        from homeassistant.helpers import entity_platform as ep
+
+        requested = tool_input.tool_args["entities"]
+        ids = [item["entity_id"] for item in requested]
+        if len(set(ids)) != len(ids):
+            return ToolResult(data={"error": "Duplicate IDs", "prepared": False})
+        registry = er.async_get(hass)
+        snapshot = []
+        blockers = []
+        for item in requested:
+            entity_id = item["entity_id"]
+            entry = registry.async_get(entity_id)
+            state = hass.states.get(entity_id)
+            if entry is None or entry.unique_id != item["unique_id"]:
+                blockers.append({"entity_id": entity_id, "reason": "registry_or_unique_id_mismatch"})
+                continue
+            try:
+                platforms = ep.async_get_platforms(hass, entry.platform)
+                loaded = any(
+                    entity_id in platform.entities or any(
+                        getattr(obj, "entity_id", None) == entity_id
+                        for obj in platform.entities.values()
+                    ) for platform in platforms
+                )
+            except Exception:
+                loaded = None
+            restored = bool(state and state.attributes.get("restored", False))
+            if loaded is not False or not restored or state.state != "unavailable":
+                blockers.append({"entity_id": entity_id, "reason": "not_confirmed_orphan"})
+            snapshot.append({
+                "entity_id": entity_id,
+                "unique_id": entry.unique_id,
+                "platform": entry.platform,
+                "config_entry_id": entry.config_entry_id,
+                "device_id": entry.device_id,
+                "original_name": entry.original_name,
+                "name": entry.name,
+                "disabled_by": str(entry.disabled_by) if entry.disabled_by else None,
+                "hidden_by": str(entry.hidden_by) if entry.hidden_by else None,
+                "state": state.state if state else None,
+                "restored": restored,
+                "runtime_loaded": loaded,
+                "history_review_required": True,
+            })
+        if blockers:
+            return ToolResult(data={
+                "prepared": False, "blockers": blockers, "read_only": True
+            })
+        payload = {
+            "schema_version": 1,
+            "created_at": time.time(),
+            "purpose": "registry_entry_cleanup_review_only",
+            "entity_count": len(snapshot),
+            "entities": snapshot,
+            "history_preservation_required": True,
+            "registry_mutated": False,
+            "recorder_mutated": False,
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        folder = Path(hass.config.config_dir) / "dashboard_reader" / "backups"
+        folder.mkdir(parents=True, exist_ok=True)
+        filename = "registry_plan_" + digest[:16] + ".json"
+        target = folder / filename
+        if target.is_symlink():
+            return ToolResult(data={"prepared": False, "error": "Unsafe path"})
+        if not target.exists():
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                output.write(serialized)
+                output.flush()
+                os.fsync(output.fileno())
+        return ToolResult(data={
+            "prepared": True,
+            "plan_filename": filename,
+            "sha256": digest,
+            "entity_count": len(snapshot),
+            "entities": [item["entity_id"] for item in snapshot],
+            "history_review_required": True,
+            "registry_mutated": False,
+            "recorder_mutated": False,
+            "note": "Metadata snapshot is not a complete Home Assistant backup. No deletion tool is exposed.",
+        })
+
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
@@ -2824,7 +2938,7 @@ def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
         PrepareLovelaceCardAdd(), ApplyLovelaceCardAdd(),
         PrepareLovelaceCardDelete(), ApplyLovelaceCardDelete(),
         PrepareLovelaceCardMove(), ApplyLovelaceCardMove(),
-        EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(), EntityRegistryCleanupSafetyAudit(),
+        EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(), EntityRegistryCleanupSafetyAudit(), PrepareEntityRegistryDeletionPlan(),
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
         ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(),
         PrepareConfigFileChange(), ApplyConfigFileChange(), RestoreConfigFileBackup(),
