@@ -2028,16 +2028,24 @@ def storage(hass, name):
     return dashboard
 
 
-def locate(config, view_index, card_index):
+def locate(config, view_index, card_index, section_index=None):
     views = config.get("views", [])
-    if type(view_index) is not int or view_index < 0 or view_index >= len(views):
+    if type(view_index) is not int or not 0 <= view_index < len(views):
         raise ValueError("Invalid view index")
     view = views[view_index]
-    if not isinstance(view.get("cards", []), list):
+    if section_index is None:
+        if view.get("sections"):
+            raise ValueError("Section index required for section-based dashboard")
+        cards = view.get("cards", [])
+    else:
+        sections = view.get("sections", [])
+        if type(section_index) is not int or not 0 <= section_index < len(sections):
+            raise ValueError("Invalid section index")
+        cards = sections[section_index].get("cards", [])
+    if not isinstance(cards, list):
         raise ValueError("Invalid cards list")
-    cards = view.get("cards", [])
-    if card_index < 0 or card_index > len(cards):
-        raise ValueError("Card index out of range; sections are not supported for edits")
+    if type(card_index) is not int or not 0 <= card_index <= len(cards):
+        raise ValueError("Card index out of range")
     return cards
 
 
@@ -2073,6 +2081,7 @@ def backup_path(hass, filename):
 PARAMS = {
     vol.Required("name"): str,
     vol.Required("view_index"): vol.All(int, vol.Range(min=0)),
+    vol.Optional("section_index"): vol.All(int, vol.Range(min=0)),
     vol.Required("card_index"): vol.All(int, vol.Range(min=0)),
     vol.Required("draft_filename"): str,
     vol.Required("expected_dashboard_sha256"): HASH,
@@ -2116,7 +2125,7 @@ class PrepareLovelaceCardChange(Tool):
             card = load_draft(hass, args["draft_filename"])
             if current_hash != args["expected_dashboard_sha256"] or digest(card) != args["expected_draft_sha256"]:
                 raise ValueError("SHA256 mismatch")
-            cards = locate(config, args["view_index"], args["card_index"])
+            cards = locate(config, args["view_index"], args["card_index"], args.get("section_index"))
             return ToolResult(data={"ready_for_approval": True, "dashboard_sha256": current_hash,
                                     "operation": "append" if args["card_index"] == len(cards) else "replace",
                                     "old_card_sha256": digest(cards[args["card_index"]]) if args["card_index"] < len(cards) else None,
@@ -2145,7 +2154,7 @@ class ApplyLovelaceCardChange(Tool):
             if digest(card) != args["expected_draft_sha256"]:
                 raise ValueError("Draft changed; refusing write")
             updated = copy.deepcopy(original)
-            cards = locate(updated, args["view_index"], args["card_index"])
+            cards = locate(updated, args["view_index"], args["card_index"], args.get("section_index"))
             if args["card_index"] == len(cards):
                 cards.append(card)
             else:
