@@ -31,11 +31,13 @@ def storage(hass, name):
     manager = hass.data.get("lovelace")
     if manager is None:
         raise ValueError("Lovelace manager is unavailable")
-    url_path = name.removeprefix("lovelace.").replace("_", "-")
+    url_path = name.removeprefix("lovelace.")
     dashboards = getattr(manager, "dashboards", {})
     dashboard = dashboards.get(url_path)
     if dashboard is None or not hasattr(dashboard, "async_save"):
         raise ValueError("Dashboard is not available through the Lovelace storage API")
+    if dashboard.__class__.__name__ != "LovelaceStorage":
+        raise ValueError("Only storage-mode dashboards may be edited")
     return dashboard
 
 
@@ -47,7 +49,7 @@ def locate(config, view_index, card_index):
     if not isinstance(view.get("cards", []), list):
         raise ValueError("Invalid cards list")
     cards = view.get("cards", [])
-    if card_index < 0 or card_index >= len(cards):
+    if card_index < 0 or card_index > len(cards):
         raise ValueError("Card index out of range; sections are not supported for edits")
     return cards
 
@@ -91,6 +93,26 @@ PARAMS = {
 }
 
 
+
+class LovelaceCardStatus(Tool):
+    name = "dashboard_reader__lovelace_card_status"
+    title = "Read dashboard SHA and editable card counts"
+    description = "Read-only status to prepare SHA-gated Lovelace card edits."
+    integration = "dashboard_reader"
+    annotations = READ
+    parameters = vol.Schema({vol.Required("name"): str})
+
+    async def async_call(self, hass, tool_input, llm_context):
+        try:
+            config = await storage(hass, tool_input.tool_args["name"]).async_load(False)
+            return ToolResult(data={"dashboard_sha256": digest(config),
+                                    "views": [{"index": i, "title": v.get("title", ""),
+                                               "editable_cards": len(v.get("cards", [])),
+                                               "sections": len(v.get("sections", []))}
+                                              for i, v in enumerate(config.get("views", []))]})
+        except (ValueError, OSError, TypeError, KeyError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
 class PrepareLovelaceCardChange(Tool):
     name = "dashboard_reader__prepare_lovelace_card_change"
     title = "Preview safe Lovelace card replacement"
@@ -109,7 +131,8 @@ class PrepareLovelaceCardChange(Tool):
                 raise ValueError("SHA256 mismatch")
             cards = locate(config, args["view_index"], args["card_index"])
             return ToolResult(data={"ready_for_approval": True, "dashboard_sha256": current_hash,
-                                    "old_card_sha256": digest(cards[args["card_index"]]),
+                                    "operation": "append" if args["card_index"] == len(cards) else "replace",
+                                    "old_card_sha256": digest(cards[args["card_index"]]) if args["card_index"] < len(cards) else None,
                                     "new_card_sha256": digest(card),
                                     "draft_filename": args["draft_filename"]})
         except (ValueError, OSError, TypeError, KeyError, json.JSONDecodeError) as exc:
@@ -136,7 +159,10 @@ class ApplyLovelaceCardChange(Tool):
                 raise ValueError("Draft changed; refusing write")
             updated = copy.deepcopy(original)
             cards = locate(updated, args["view_index"], args["card_index"])
-            cards[args["card_index"]] = card
+            if args["card_index"] == len(cards):
+                cards.append(card)
+            else:
+                cards[args["card_index"]] = card
             name = "lovelace_backup_" + str(time.time_ns()) + ".json"
             path = backup_path(hass, name)
             record = {"dashboard": args["name"], "before": original,
