@@ -2715,6 +2715,106 @@ class PrepareEntityRegistryCleanup(Tool):
         })
 
 
+
+class EntityRegistryCleanupSafetyAudit(Tool):
+    """Inspect exact candidates and prevent removal when history is unreviewed."""
+    name = "dashboard_reader__entity_registry_cleanup_safety_audit"
+    title = "Audit entity registry cleanup safety"
+    description = (
+        "Read-only safety audit of explicit registry entries. Checks runtime "
+        "presence, registry IDs, restored state and recorder statistics metadata. "
+        "Returns blockers and does not modify any entity or recorder data."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Required("entity_ids"): vol.All(
+            [vol.All(str, vol.Match(r"^[a-z0-9_]+\.[a-z0-9_]+$"))],
+            vol.Length(min=1, max=20),
+        ),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        from homeassistant.helpers import entity_registry as er
+        from homeassistant.helpers import entity_platform as ep
+
+        ids = tool_input.tool_args["entity_ids"]
+        if len(set(ids)) != len(ids):
+            return ToolResult(data={"error": "Duplicate IDs", "read_only": True})
+        registry = er.async_get(hass)
+        results = []
+        for entity_id in ids:
+            entry = registry.async_get(entity_id)
+            state = hass.states.get(entity_id)
+            blockers = []
+            if entry is None:
+                blockers.append("missing_registry_entry")
+            else:
+                try:
+                    platforms = ep.async_get_platforms(hass, entry.platform)
+                    loaded = any(
+                        entity_id in platform.entities or any(
+                            getattr(obj, "entity_id", None) == entity_id
+                            for obj in platform.entities.values()
+                        ) for platform in platforms
+                    )
+                except Exception:
+                    loaded = None
+                    blockers.append("runtime_check_failed")
+                if loaded is not False:
+                    blockers.append("active_or_unverified_runtime")
+                if entry.disabled_by is not None:
+                    blockers.append("disabled_entry_requires_review")
+            restored = bool(state and state.attributes.get("restored", False))
+            if state is None or state.state != "unavailable" or not restored:
+                blockers.append("not_restored_unavailable")
+            # Recorder metadata may outlive the entity. Absence of metadata
+            # cannot prove there is no historical data in the database.
+            statistics_metadata = "not_checked"
+            try:
+                from homeassistant.components.recorder import get_instance
+                from homeassistant.components.recorder.statistics import (
+                    get_metadata,
+                )
+                recorder = get_instance(hass)
+                if recorder is not None:
+                    def _lookup():
+                        with recorder.get_session() as session:
+                            return get_metadata(
+                                hass, session, statistic_ids={entity_id},
+                            )
+                    metadata = await recorder.async_add_executor_job(_lookup)
+                    statistics_metadata = (
+                        "present" if metadata else "not_found_unverified"
+                    )
+            except Exception:
+                statistics_metadata = "unavailable"
+            if statistics_metadata != "not_found_unverified":
+                blockers.append("statistics_review_required")
+            else:
+                blockers.append("history_review_required")
+            results.append({
+                "entity_id": entity_id,
+                "unique_id": entry.unique_id if entry else None,
+                "platform": entry.platform if entry else None,
+                "state": state.state if state else None,
+                "restored": restored,
+                "statistics_metadata": statistics_metadata,
+                "blockers": blockers,
+                "safe_to_delete_automatically": False,
+            })
+        return ToolResult(data={
+            "read_only": True,
+            "entities": results,
+            "automatic_deletion_allowed": False,
+            "note": (
+                "Historical data and external references cannot be exhaustively "
+                "excluded by this audit. Require separate verified backup and "
+                "explicit deletion approval."
+            ),
+        })
+
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
@@ -2724,7 +2824,7 @@ def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
         PrepareLovelaceCardAdd(), ApplyLovelaceCardAdd(),
         PrepareLovelaceCardDelete(), ApplyLovelaceCardDelete(),
         PrepareLovelaceCardMove(), ApplyLovelaceCardMove(),
-        EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(),
+        EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(), EntityRegistryCleanupSafetyAudit(),
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
         ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(),
         PrepareConfigFileChange(), ApplyConfigFileChange(), RestoreConfigFileBackup(),
