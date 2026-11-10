@@ -1665,12 +1665,317 @@ class ReadEnergyStatistics(Tool):
         except (ValueError, TypeError, KeyError, ImportError, AttributeError) as exc:
             return ToolResult(data={"error": str(exc)}, error=True)
 
+
+# Scoped /config text file manager. No symlinks, secrets, databases or .storage.
+FILE_MGR_EXT = {".py", ".json", ".yaml", ".yml", ".js", ".ts", ".css", ".html",
+                ".txt", ".md", ".xml", ".csv", ".toml", ".ini", ".cfg"}
+FILE_MGR_BLOCKED = {".storage", ".git", ".ssh", "secrets.yaml", ".env",
+                    "known_devices.yaml", "auth", "auth_provider.homeassistant",
+                    "home-assistant_v2.db", "home-assistant_v2.db-shm",
+                    "home-assistant_v2.db-wal"}
+FILE_MGR_LIMIT = 400_000
+FILE_MGR_CONFIRM = "APPLY_APPROVED_CONFIG_FILE_CHANGE"
+FILE_MGR_RESTORE = "RESTORE_APPROVED_CONFIG_FILE_BACKUP"
+
+def _managed_path(hass, relative, *, write=False):
+    if not isinstance(relative, str) or not relative or "\x00" in relative or "\\" in relative:
+        raise ValueError("Invalid relative /config path")
+    p = Path(relative)
+    if p.is_absolute() or any(x in ("", ".", "..") for x in p.parts):
+        raise ValueError("Path must be relative to /config")
+    if any(part.startswith(".") or part.lower() in FILE_MGR_BLOCKED or
+           "secret" in part.lower() or "token" in part.lower() or
+           "password" in part.lower() or "credential" in part.lower()
+           for part in p.parts):
+        raise ValueError("Protected path")
+    if write and p.suffix.lower() not in FILE_MGR_EXT:
+        raise ValueError("Unsupported editable file type")
+    root = Path(hass.config.config_dir)
+    if root.is_symlink():
+        raise ValueError("Configuration root cannot be a symlink")
+    dest = root
+    for part in p.parts:
+        dest = dest / part
+        if dest.is_symlink():
+            raise ValueError("Symlink paths are forbidden")
+    if not dest.resolve(strict=False).is_relative_to(root.resolve()):
+        raise ValueError("Path outside /config")
+    return dest
+
+def _managed_text(hass, relative):
+    path = _managed_path(hass, relative)
+    if path.suffix.lower() not in FILE_MGR_EXT or not path.is_file():
+        raise ValueError("Not an allowed text file")
+    if path.stat().st_size > FILE_MGR_LIMIT:
+        raise ValueError("File too large")
+    raw = path.read_bytes()
+    if b"\x00" in raw:
+        raise ValueError("Binary file")
+    return raw.decode("utf-8"), hashlib.sha256(raw).hexdigest()
+
+def _managed_validate(content, relative):
+    ext = Path(relative).suffix.lower()
+    if ext == ".py":
+        compile(content, relative, "exec")
+    elif ext == ".json":
+        json.loads(content)
+    elif ext in (".yaml", ".yml"):
+        yaml.safe_load(content)
+
+def _managed_backup_dir(hass):
+    root = Path(hass.config.config_dir) / "dashboard_reader" / "file_backups"
+    if root.is_symlink():
+        raise ValueError("Backup directory is a symlink")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+class ListConfigFiles(Tool):
+    name = "dashboard_reader__list_files"
+    title = "List text files inside /config"
+    description = "Read-only directory listing inside /config, excluding sensitive paths."
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Optional("directory", default="custom_components"): str,
+        vol.Optional("limit", default=100): vol.All(int, vol.Range(min=1, max=200)),
+    })
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        def run():
+            directory = args["directory"]
+            path = _managed_path(hass, directory)
+            if not path.is_dir():
+                raise ValueError("Directory not found")
+            entries = []
+            for child in sorted(path.iterdir(), key=lambda p: p.name.lower()):
+                try:
+                    rel = str(child.relative_to(hass.config.config_dir))
+                    _managed_path(hass, rel)
+                    if child.is_dir() or (child.is_file() and child.suffix.lower() in FILE_MGR_EXT):
+                        entries.append({"path": rel, "type": "directory" if child.is_dir() else "file",
+                                        "bytes": child.stat().st_size if child.is_file() else None})
+                except (ValueError, OSError):
+                    continue
+                if len(entries) >= args["limit"]:
+                    break
+            return {"directory": directory, "entries": entries, "truncated": len(entries) >= args["limit"]}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+class ReadConfigFile(Tool):
+    name = "dashboard_reader__read_file"
+    title = "Read redacted /config text file"
+    description = "Read-only chunked file content with raw SHA256; sensitive paths are blocked."
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Required("path"): str,
+        vol.Optional("offset", default=0): vol.All(int, vol.Range(min=0)),
+        vol.Optional("limit", default=8000): vol.All(int, vol.Range(min=1, max=12000)),
+    })
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        def run():
+            content, sha = _managed_text(hass, args["path"])
+            redacted = redact_inline_secrets(content)
+            start = args["offset"]
+            end = min(start + args["limit"], len(redacted))
+            return {"path": args["path"], "sha256": sha, "characters": len(redacted),
+                    "chunk": redacted[start:end], "next_offset": end if end < len(redacted) else None}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError, UnicodeError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+class SearchConfigFiles(Tool):
+    name = "dashboard_reader__search_files"
+    title = "Search source files inside /config"
+    description = "Search bounded UTF-8 text files; returns redacted matching lines, not secrets."
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Required("directory"): str,
+        vol.Required("query"): vol.All(str, vol.Length(min=2, max=120)),
+        vol.Optional("limit", default=30): vol.All(int, vol.Range(min=1, max=100)),
+    })
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        def run():
+            root = _managed_path(hass, args["directory"])
+            if not root.is_dir():
+                raise ValueError("Directory not found")
+            found = []
+            scanned = 0
+            for base, dirs, files in os.walk(root, followlinks=False):
+                dirs[:] = [d for d in dirs if not (Path(base) / d).is_symlink()
+                           and not d.startswith(".") and d.lower() not in FILE_MGR_BLOCKED]
+                for filename in files:
+                    rel = str((Path(base) / filename).relative_to(hass.config.config_dir))
+                    try:
+                        content, _ = _managed_text(hass, rel)
+                    except (ValueError, OSError, UnicodeError):
+                        continue
+                    scanned += 1
+                    for number, line in enumerate(content.splitlines(), 1):
+                        if args["query"].lower() in line.lower():
+                            found.append({"path": rel, "line": number,
+                                          "text": redact_inline_secrets(line[:350])})
+                            if len(found) >= args["limit"]:
+                                return {"matches": found, "scanned_files": scanned, "truncated": True}
+                    if scanned >= 500:
+                        return {"matches": found, "scanned_files": scanned, "truncated": True}
+            return {"matches": found, "scanned_files": scanned, "truncated": False}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+class PrepareConfigFileChange(Tool):
+    name = "dashboard_reader__prepare_file_change"
+    title = "Prepare a reviewed /config file change"
+    description = "Stages a complete replacement from an existing draft. Does not modify target."
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Required("path"): str,
+        vol.Required("draft_filename"): str,
+        vol.Required("expected_target_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("expected_draft_sha256"): vol.Match(r"[0-9a-f]{64}"),
+    })
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        def run():
+            path = _managed_path(hass, args["path"], write=True)
+            old = path.read_bytes() if path.is_file() else b""
+            old_sha = hashlib.sha256(old).hexdigest() if old else "0" * 64
+            if old_sha != args["expected_target_sha256"]:
+                raise ValueError("Target SHA256 mismatch")
+            draft = read_draft_text(hass, args["draft_filename"])
+            if hash_text(draft) != args["expected_draft_sha256"]:
+                raise ValueError("Draft SHA256 mismatch")
+            if len(draft.encode("utf-8")) > FILE_MGR_LIMIT:
+                raise ValueError("File too large")
+            _managed_validate(draft, args["path"])
+            return {"path": args["path"], "old_sha256": old_sha,
+                    "new_sha256": hash_text(draft), "new_bytes": len(draft.encode("utf-8")),
+                    "draft_filename": args["draft_filename"], "ready_for_approval": True}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError, SyntaxError, UnicodeError, yaml.YAMLError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+class ApplyConfigFileChange(Tool):
+    name = "dashboard_reader__apply_file_change"
+    title = "Apply an explicitly approved /config file change"
+    description = "DANGEROUS: SHA256-gated atomic write with immutable backup; requires explicit approval."
+    integration = DOMAIN
+    annotations = ToolAnnotations(read_only=False, destructive=True, idempotent=False, open_world=False)
+    parameters = vol.Schema({
+        vol.Required("path"): str,
+        vol.Required("draft_filename"): str,
+        vol.Required("expected_target_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("expected_draft_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("confirmation"): vol.In((FILE_MGR_CONFIRM,)),
+    })
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        def run():
+            path = _managed_path(hass, args["path"], write=True)
+            if not path.parent.is_dir():
+                raise ValueError("Parent directory must already exist")
+            old = path.read_bytes() if path.is_file() else b""
+            old_sha = hashlib.sha256(old).hexdigest() if path.exists() else "0" * 64
+            if old_sha != args["expected_target_sha256"]:
+                raise ValueError("Target SHA256 mismatch")
+            draft = read_draft_text(hass, args["draft_filename"])
+            data = draft.encode("utf-8")
+            if hashlib.sha256(data).hexdigest() != args["expected_draft_sha256"]:
+                raise ValueError("Draft SHA256 mismatch")
+            if len(data) > FILE_MGR_LIMIT:
+                raise ValueError("File too large")
+            _managed_validate(draft, args["path"])
+            backup_dir = _managed_backup_dir(hass)
+            backup_name = "backup_" + str(time.time_ns()) + ".json"
+            backup_path = backup_dir / backup_name
+            record = {"path": args["path"], "existed": path.exists(),
+                      "old_sha256": old_sha, "new_sha256": hashlib.sha256(data).hexdigest(),
+                      "old_content": old.decode("utf-8") if old else ""}
+            with backup_path.open("x", encoding="utf-8") as handle:
+                json.dump(record, handle, ensure_ascii=False)
+            fd, temp = tempfile.mkstemp(prefix=".ha_edit_", dir=str(path.parent))
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if path.is_symlink():
+                    raise ValueError("Symlink appeared during write")
+                os.replace(temp, path)
+            finally:
+                if os.path.exists(temp):
+                    os.unlink(temp)
+            return {"installed": True, "path": args["path"],
+                    "sha256": record["new_sha256"], "backup": backup_name,
+                    "restart_required": path.suffix.lower() == ".py"}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError, SyntaxError, UnicodeError, yaml.YAMLError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+class RestoreConfigFileBackup(Tool):
+    name = "dashboard_reader__restore_file_backup"
+    title = "Restore explicitly approved /config backup"
+    description = "DANGEROUS: Restore backed-up file only if current SHA256 matches applied version."
+    integration = DOMAIN
+    annotations = ToolAnnotations(read_only=False, destructive=True, idempotent=False, open_world=False)
+    parameters = vol.Schema({
+        vol.Required("backup"): vol.Match(r"backup_[0-9]+\.json"),
+        vol.Required("expected_current_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("confirmation"): vol.In((FILE_MGR_RESTORE,)),
+    })
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        def run():
+            backup = _managed_backup_dir(hass) / args["backup"]
+            if backup.is_symlink() or not backup.is_file():
+                raise ValueError("Backup not found")
+            record = json.loads(backup.read_text(encoding="utf-8"))
+            path = _managed_path(hass, record["path"], write=True)
+            current = path.read_bytes() if path.is_file() else b""
+            sha = hashlib.sha256(current).hexdigest() if path.exists() else "0" * 64
+            if sha != args["expected_current_sha256"] or sha != record["new_sha256"]:
+                raise ValueError("File changed after update; refusing restore")
+            old = record["old_content"].encode("utf-8")
+            if hashlib.sha256(old).hexdigest() != record["old_sha256"] and record["existed"]:
+                raise ValueError("Corrupted backup")
+            if not record["existed"]:
+                path.unlink()
+            else:
+                fd, temp = tempfile.mkstemp(prefix=".ha_restore_", dir=str(path.parent))
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(old)
+                    os.replace(temp, path)
+                finally:
+                    if os.path.exists(temp):
+                        os.unlink(temp)
+            return {"restored": True, "path": record["path"], "sha256": record["old_sha256"]}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError, UnicodeError, KeyError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
     """Expose dashboard inspection and isolated draft tools."""
     return LLMTools(tools=[
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
+        ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(),
+        PrepareConfigFileChange(), ApplyConfigFileChange(), RestoreConfigFileBackup(),
         ListSystemPanels(), ReadSystemPanel(), EnergyConfigStatus(), ReadEnergyStatistics(),
         PrepareSystemChange(), ApplySystemChange(), RestoreSystemBackup(),
         ExportCard(), ListExports(), ReadExport(),
