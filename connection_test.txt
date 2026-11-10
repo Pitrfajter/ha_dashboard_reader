@@ -1,0 +1,2 @@
+GitHub connection write test for dashboard_reader.
+No secrets or HA configuration.
