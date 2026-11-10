@@ -1702,6 +1702,17 @@ def _managed_path(hass, relative, *, write=False):
         raise ValueError("Path outside /config")
     return dest
 
+def _managed_redact(content):
+    """Conservatively redact entire lines that appear to contain credentials."""
+    out = []
+    for line in content.splitlines(keepends=True):
+        if SECRET_KEYS.search(line) or re.search(r"(?i)authorization|bearer\\s|private.key|client.secret", line):
+            out.append("[REDACTED SENSITIVE LINE]\\n" if line.endswith("\\n") else "[REDACTED SENSITIVE LINE]")
+        else:
+            out.append(redact_inline_secrets(line))
+    return "".join(out)
+
+
 def _managed_text(hass, relative):
     path = _managed_path(hass, relative)
     if path.suffix.lower() not in FILE_MGR_EXT or not path.is_file():
@@ -1779,7 +1790,7 @@ class ReadConfigFile(Tool):
         args = tool_input.tool_args
         def run():
             content, sha = _managed_text(hass, args["path"])
-            redacted = redact_inline_secrets(content)
+            redacted = _managed_redact(content)
             start = args["offset"]
             end = min(start + args["limit"], len(redacted))
             return {"path": args["path"], "sha256": sha, "characters": len(redacted),
@@ -1821,7 +1832,7 @@ class SearchConfigFiles(Tool):
                     for number, line in enumerate(content.splitlines(), 1):
                         if args["query"].lower() in line.lower():
                             found.append({"path": rel, "line": number,
-                                          "text": redact_inline_secrets(line[:350])})
+                                          "text": _managed_redact(line[:350])})
                             if len(found) >= args["limit"]:
                                 return {"matches": found, "scanned_files": scanned, "truncated": True}
                     if scanned >= 500:
@@ -1848,8 +1859,10 @@ class PrepareConfigFileChange(Tool):
         args = tool_input.tool_args
         def run():
             path = _managed_path(hass, args["path"], write=True)
+            if path.exists() and not path.is_file():
+                raise ValueError("Target is not a regular file")
             old = path.read_bytes() if path.is_file() else b""
-            old_sha = hashlib.sha256(old).hexdigest() if old else "0" * 64
+            old_sha = hashlib.sha256(old).hexdigest() if path.exists() else "0" * 64
             if old_sha != args["expected_target_sha256"]:
                 raise ValueError("Target SHA256 mismatch")
             draft = read_draft_text(hass, args["draft_filename"])
@@ -1883,8 +1896,8 @@ class ApplyConfigFileChange(Tool):
         args = tool_input.tool_args
         def run():
             path = _managed_path(hass, args["path"], write=True)
-            if not path.parent.is_dir():
-                raise ValueError("Parent directory must already exist")
+            if not path.parent.is_dir() or path.parent.is_symlink():
+                raise ValueError("Parent directory must already exist and not be a symlink")
             old = path.read_bytes() if path.is_file() else b""
             old_sha = hashlib.sha256(old).hexdigest() if path.exists() else "0" * 64
             if old_sha != args["expected_target_sha256"]:
