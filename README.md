@@ -1,0 +1,1 @@
+# ha_dashboard_reader
