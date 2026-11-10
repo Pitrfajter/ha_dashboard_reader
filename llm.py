@@ -2453,6 +2453,88 @@ class EntityRegistryInspect(Tool):
         })
 
 
+
+class EntityRegistryAudit(Tool):
+    """Report potentially unhealthy registry entries without modifying HA."""
+    name = "dashboard_reader__entity_registry_audit"
+    title = "Audit entity registry health"
+    description = (
+        "Read-only scan of Home Assistant's entity registry. Filter by domain or "
+        "entity ID prefix; report missing states, restored states, disabled entries "
+        "and possible duplicate-name suffixes. Findings are diagnostic hints, "
+        "not proof of orphaned or broken entities."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Optional("domain", default="input_number"): vol.All(
+            str, vol.Match(r"^[a-z0-9_]+$")),
+        vol.Optional("prefix", default=""): vol.All(
+            str, vol.Length(max=100), vol.Match(r"^[a-z0-9_.]*$")),
+        vol.Optional("limit", default=100): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=200)),
+    })
+
+    async def async_call(self, hass: HomeAssistant, tool_input: ToolInput,
+                         llm_context: LLMContext) -> ToolResult:
+        from homeassistant.helpers import entity_registry as er
+
+        args = tool_input.tool_args
+        domain = args.get("domain", "input_number")
+        prefix = args.get("prefix", "")
+        limit = args.get("limit", 100)
+        registry = er.async_get(hass)
+        matching = sorted(
+            (entry for entry in registry.entities.values()
+             if entry.entity_id.startswith(domain + ".")
+             and entry.entity_id.startswith(prefix)),
+            key=lambda entry: entry.entity_id,
+        )
+        findings = []
+        counts = {"missing_state": 0, "restored": 0,
+                  "disabled": 0, "possible_suffix_conflict": 0}
+        for entry in matching:
+            state = hass.states.get(entry.entity_id)
+            issues = []
+            if entry.disabled_by is not None:
+                issues.append("disabled")
+            elif state is None:
+                issues.append("missing_state")
+            if state is not None and state.attributes.get("restored") is True:
+                issues.append("restored")
+            # A numbered suffix can be normal; it is only a review hint.
+            match = re.search(r"_(\\d+)$", entry.entity_id)
+            if match and registry.async_get(entry.entity_id[:match.start()]) is not None:
+                issues.append("possible_suffix_conflict")
+            for issue in issues:
+                counts[issue] += 1
+            if issues and len(findings) < limit:
+                findings.append({
+                    "entity_id": entry.entity_id,
+                    "platform": entry.platform,
+                    "issues": issues,
+                    "state": state.state if state is not None else None,
+                    "disabled_by": str(entry.disabled_by)
+                    if entry.disabled_by is not None else None,
+                })
+        return ToolResult(data={
+            "domain": domain,
+            "prefix": prefix,
+            "scanned": len(matching),
+            "issue_counts": counts,
+            "findings": findings,
+            "findings_truncated": sum(1 for entry in matching
+                if (entry.disabled_by is not None
+                    or (entry.disabled_by is None and hass.states.get(entry.entity_id) is None)
+                    or (hass.states.get(entry.entity_id) is not None
+                        and hass.states.get(entry.entity_id).attributes.get("restored") is True)
+                    or (re.search(r"_(\\d+)$", entry.entity_id) is not None
+                        and registry.async_get(re.sub(r"_\\d+$", "", entry.entity_id)) is not None)))
+                > len(findings),
+            "read_only": True,
+        })
+
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
@@ -2462,7 +2544,7 @@ def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
         PrepareLovelaceCardAdd(), ApplyLovelaceCardAdd(),
         PrepareLovelaceCardDelete(), ApplyLovelaceCardDelete(),
         PrepareLovelaceCardMove(), ApplyLovelaceCardMove(),
-        EntityRegistryInspect(),
+        EntityRegistryInspect(), EntityRegistryAudit(),
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
         ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(),
         PrepareConfigFileChange(), ApplyConfigFileChange(), RestoreConfigFileBackup(),
