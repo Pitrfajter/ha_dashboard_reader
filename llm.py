@@ -2436,10 +2436,22 @@ class EntityRegistryInspect(Tool):
         runtime_loaded = None
         runtime_check_error = None
         try:
-            platforms = ep.async_get_platforms(hass, domain)
-            runtime_loaded = any(
-                entity_id in platform.entities for platform in platforms
+            # Platforms are indexed by integration domain (e.g. bosch_homecom),
+            # not by entity domain (e.g. sensor).
+            platforms = ep.async_get_platforms(
+                hass, entry.platform if entry is not None else domain
             )
+            runtime_loaded = any(
+                entity_id in platform.entities or any(
+                    getattr(obj, "entity_id", None) == entity_id
+                    for obj in platform.entities.values()
+                )
+                for platform in platforms
+            )
+            # A live non-restored state is stronger evidence than an incomplete
+            # platform lookup; never mark it as an orphan.
+            if state is not None and not state.attributes.get("restored", False) and state.state not in ("unavailable", "unknown"):
+                runtime_loaded = True
         except Exception as exc:
             runtime_check_error = type(exc).__name__
 
