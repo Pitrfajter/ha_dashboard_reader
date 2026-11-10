@@ -2929,6 +2929,88 @@ class PrepareEntityRegistryDeletionPlan(Tool):
         })
 
 
+
+class VerifyEntityRegistryDeletionPlan(Tool):
+    """Read-only validation of a previously stored registry cleanup plan."""
+    name = "dashboard_reader__verify_entity_registry_deletion_plan"
+    title = "Verify entity registry deletion plan"
+    description = (
+        "Read-only verification of a saved cleanup plan: exact SHA-256, "
+        "unique IDs, platform, runtime status and restored states. "
+        "No deletion or recorder changes. A metadata plan is not a full backup."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Required("filename"): vol.Match(r"^registry_plan_[0-9a-f]{16}\.json$"),
+        vol.Required("expected_sha256"): vol.Match(r"^[0-9a-f]{64}$"),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        from homeassistant.helpers import entity_registry as er
+        from homeassistant.helpers import entity_platform as ep
+
+        args = tool_input.tool_args
+        folder = Path(hass.config.config_dir) / "dashboard_reader" / "backups"
+        path = folder / args["filename"]
+        if not path.is_file() or path.is_symlink():
+            return ToolResult(data={"verified": False, "error": "Plan not found"})
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != args["expected_sha256"] or len(raw) > 200000:
+            return ToolResult(data={"verified": False, "error": "Plan hash/size mismatch"})
+        try:
+            plan = json.loads(raw)
+        except (ValueError, UnicodeError):
+            return ToolResult(data={"verified": False, "error": "Invalid plan JSON"})
+        items = plan.get("entities", [])
+        if (plan.get("schema_version") != 1
+                or not isinstance(items, list) or not 1 <= len(items) <= 20
+                or plan.get("entity_count") != len(items)):
+            return ToolResult(data={"verified": False, "error": "Invalid plan schema"})
+        registry = er.async_get(hass)
+        findings = []
+        seen = set()
+        for item in items:
+            entity_id = item.get("entity_id")
+            blockers = []
+            if not isinstance(entity_id, str) or entity_id in seen:
+                return ToolResult(data={"verified": False, "error": "Duplicate/invalid entity"})
+            seen.add(entity_id)
+            entry = registry.async_get(entity_id)
+            state = hass.states.get(entity_id)
+            if entry is None or entry.unique_id != item.get("unique_id"):
+                blockers.append("registry_or_unique_id_changed")
+            elif entry.platform != item.get("platform"):
+                blockers.append("platform_changed")
+            else:
+                try:
+                    platforms = ep.async_get_platforms(hass, entry.platform)
+                    if any(
+                        entity_id in p.entities or any(
+                            getattr(obj, "entity_id", None) == entity_id
+                            for obj in p.entities.values()
+                        ) for p in platforms
+                    ):
+                        blockers.append("entity_now_loaded")
+                except Exception:
+                    blockers.append("runtime_check_failed")
+            if (state is None or state.state != "unavailable"
+                    or not state.attributes.get("restored", False)):
+                blockers.append("state_changed")
+            findings.append({"entity_id": entity_id, "blockers": blockers})
+        return ToolResult(data={
+            "verified": all(not x["blockers"] for x in findings),
+            "plan_sha256": digest,
+            "entries": findings,
+            "history_preservation_required": True,
+            "full_backup_verified": False,
+            "read_only": True,
+            "deletion_performed": False,
+            "note": "Registry snapshot cannot guarantee recovery; obtain full HA backup before deletion.",
+        })
+
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
@@ -2938,7 +3020,7 @@ def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
         PrepareLovelaceCardAdd(), ApplyLovelaceCardAdd(),
         PrepareLovelaceCardDelete(), ApplyLovelaceCardDelete(),
         PrepareLovelaceCardMove(), ApplyLovelaceCardMove(),
-        EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(), EntityRegistryCleanupSafetyAudit(), PrepareEntityRegistryDeletionPlan(),
+        EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(), EntityRegistryCleanupSafetyAudit(), PrepareEntityRegistryDeletionPlan(), VerifyEntityRegistryDeletionPlan(),
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
         ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(),
         PrepareConfigFileChange(), ApplyConfigFileChange(), RestoreConfigFileBackup(),
