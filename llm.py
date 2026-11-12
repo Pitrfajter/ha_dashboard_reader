@@ -3128,6 +3128,64 @@ class ApplyBoschRegistryCleanup(Tool):
         })
 
 
+
+class InspectIntegrationExport(Tool):
+    name = "dashboard_reader__inspect_integration_export"
+    title = "Inspect integration export readiness"
+    description = "Read-only SHA256 inventory and fail-closed credential scan; never returns source text or credentials."
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = vol.Schema({
+        vol.Optional("integration", default="bosch_homecom"): vol.In(["bosch_homecom"]),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        def run():
+            root = Path(hass.config.config_dir) / "custom_components"
+            target = root / tool_input.tool_args["integration"]
+            if target.is_symlink() or not target.is_dir():
+                return {"ready": False, "error": "Integration missing or symlinked"}
+            skip_dirs = {"__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".venv", "venv"}
+            allowed = {".py", ".json", ".yaml", ".yml"}
+            patterns = (
+                re.compile(rb"(?i)(?:access_token|refresh_token|client_secret|api_key|password|private_key|authorization|passwd)\\s*[=:]\\s*[\\\"']?[^\\s\\\"']{5,}"),
+                re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+                re.compile(rb"(?i)[a-z][a-z0-9+.-]*://[^\\s/@:]+:[^\\s/@]+@"),
+            )
+            files = []
+            blocked = []
+            skipped = 0
+            total = 0
+            for path in sorted(target.rglob("*")):
+                relative = path.relative_to(target)
+                if any(p in skip_dirs for p in relative.parts):
+                    continue
+                if path.is_symlink():
+                    blocked.append({"path": relative.as_posix(), "reason": "symlink"})
+                    continue
+                if not path.is_file():
+                    continue
+                if path.name.lower() in {"secrets.yaml", "configuration.yaml", ".env"} or path.suffix.lower() not in allowed:
+                    skipped += 1
+                    continue
+                size = path.stat().st_size
+                if size > 2000000 or total + size > 12000000:
+                    blocked.append({"path": relative.as_posix(), "reason": "size_limit"})
+                    continue
+                raw = path.read_bytes()
+                total += len(raw)
+                suspicious = any(pattern.search(raw) for pattern in patterns)
+                if suspicious:
+                    blocked.append({"path": relative.as_posix(), "reason": "possible_credential"})
+                files.append({"path": relative.as_posix(), "bytes": len(raw),
+                              "sha256": hashlib.sha256(raw).hexdigest(), "blocked": suspicious})
+            return {"integration": tool_input.tool_args["integration"],
+                    "ready": bool(files) and not blocked,
+                    "files": files, "blocked": blocked, "skipped": skipped,
+                    "note": "Static scan is not proof that code is free of credentials; no export performed."}
+        return ToolResult(data=await hass.async_add_executor_job(run))
+
+
 @callback
 def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
                     api_id: str) -> LLMTools:
@@ -3139,7 +3197,7 @@ def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
         PrepareLovelaceCardMove(), ApplyLovelaceCardMove(),
         EntityRegistryInspect(), EntityRegistryAudit(), PrepareEntityRegistryCleanup(), EntityRegistryCleanupSafetyAudit(), PrepareEntityRegistryDeletionPlan(), VerifyEntityRegistryDeletionPlan(), ApplyBoschRegistryCleanup(),
         ListDashboards(), ReadDashboard(), GetCard(), GetFragment(),
-        ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(),
+        ListConfigFiles(), ReadConfigFile(), SearchConfigFiles(), InspectIntegrationExport(),
         PrepareConfigFileChange(), ApplyConfigFileChange(), RestoreConfigFileBackup(),
         ListSystemPanels(), ReadSystemPanel(), EnergyConfigStatus(), ReadEnergyStatistics(),
         PrepareSystemChange(), ApplySystemChange(), RestoreSystemBackup(),
