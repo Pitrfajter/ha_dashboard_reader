@@ -3148,9 +3148,9 @@ class InspectIntegrationExport(Tool):
             skip_dirs = {"__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".venv", "venv"}
             allowed = {".py", ".json", ".yaml", ".yml"}
             patterns = (
-                re.compile(rb"(?i)(?:access_token|refresh_token|client_secret|api_key|password|private_key|authorization|passwd)\\s*[=:]\\s*[\\\"']?[^\\s\\\"']{5,}"),
+                re.compile(rb"(?i)(?:access_token|refresh_token|client_secret|api_key|password|private_key|authorization|passwd)\s*[=:]\s*[\\"']?[^\s\\"']{5,}"),
                 re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-                re.compile(rb"(?i)[a-z][a-z0-9+.-]*://[^\\s/@:]+:[^\\s/@]+@"),
+                re.compile(rb"(?i)[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@"),
             )
             files = []
             blocked = []
