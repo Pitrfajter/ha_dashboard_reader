@@ -2049,15 +2049,8 @@ def locate(config, view_index, card_index, section_index=None):
     return cards
 
 
-def draft_raw_sha256(hass, filename):
-    """Hash exact draft bytes, consistent with read_draft and patch_card_draft."""
-    load_draft(hass, filename)  # validate name, path and JSON before reading
-    path = Path(hass.config.config_dir) / "dashboard_reader" / "drafts" / filename
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def load_draft(hass, filename):
-    # Only JSON card drafts. No paths, symlinks, or YAML custom constructors.
+def load_draft_and_hash(hass, filename):
+    """Synchronous disk helper: call only via hass.async_add_executor_job."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\.json", filename):
         raise ValueError("Expected JSON draft basename")
     root = Path(hass.config.config_dir) / "dashboard_reader" / "drafts"
@@ -2066,10 +2059,23 @@ def load_draft(hass, filename):
     path = root / filename
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 200000:
         raise ValueError("Draft unavailable or too large")
-    card = json.loads(path.read_text(encoding="utf-8"))
+    raw = path.read_bytes()
+    if len(raw) > 200000:
+        raise ValueError("Draft unavailable or too large")
+    card = json.loads(raw.decode("utf-8"))
     if not isinstance(card, dict) or not isinstance(card.get("type"), str):
         raise ValueError("Draft must contain one Lovelace card object")
-    return card
+    return card, hashlib.sha256(raw).hexdigest()
+
+
+def load_draft(hass, filename):
+    """Legacy synchronous helper. Never call directly from the event loop."""
+    return load_draft_and_hash(hass, filename)[0]
+
+
+def draft_raw_sha256(hass, filename):
+    """Legacy synchronous helper. Never call directly from the event loop."""
+    return load_draft_and_hash(hass, filename)[1]
 
 
 def backup_path(hass, filename):
@@ -2083,6 +2089,17 @@ def backup_path(hass, filename):
     if path.is_symlink():
         raise ValueError("Unsafe backup file")
     return path
+
+
+def read_lovelace_backup(hass, filename):
+    """Synchronous, bounded backup loader; call only in executor."""
+    path = backup_path(hass, filename)
+    if not path.is_file() or path.stat().st_size > 4_000_000:
+        raise ValueError("Lovelace backup missing or too large")
+    raw = path.read_bytes()
+    if len(raw) > 4_000_000:
+        raise ValueError("Lovelace backup too large")
+    return json.loads(raw.decode("utf-8"))
 
 
 PARAMS = {
@@ -2129,8 +2146,10 @@ class PrepareLovelaceCardChange(Tool):
             args = tool_input.tool_args
             config = await storage(hass, args["name"]).async_load(False)
             current_hash = digest(config)
-            card = load_draft(hass, args["draft_filename"])
-            if current_hash != args["expected_dashboard_sha256"] or draft_raw_sha256(hass, args["draft_filename"]) != args["expected_draft_sha256"]:
+            card, draft_hash = await hass.async_add_executor_job(
+                load_draft_and_hash, hass, args["draft_filename"]
+            )
+            if current_hash != args["expected_dashboard_sha256"] or draft_hash != args["expected_draft_sha256"]:
                 raise ValueError("SHA256 mismatch")
             cards = locate(config, args["view_index"], args["card_index"], args.get("section_index"))
             return ToolResult(data={"ready_for_approval": True, "dashboard_sha256": current_hash,
@@ -2157,8 +2176,10 @@ class ApplyLovelaceCardChange(Tool):
             original = await dashboard.async_load(False)
             if digest(original) != args["expected_dashboard_sha256"]:
                 raise ValueError("Dashboard changed; refusing write")
-            card = load_draft(hass, args["draft_filename"])
-            if draft_raw_sha256(hass, args["draft_filename"]) != args["expected_draft_sha256"]:
+            card, draft_hash = await hass.async_add_executor_job(
+                load_draft_and_hash, hass, args["draft_filename"]
+            )
+            if draft_hash != args["expected_draft_sha256"]:
                 raise ValueError("Draft changed; refusing write")
             updated = copy.deepcopy(original)
             cards = locate(updated, args["view_index"], args["card_index"], args.get("section_index"))
@@ -2166,12 +2187,12 @@ class ApplyLovelaceCardChange(Tool):
                 cards.append(card)
             else:
                 cards[args["card_index"]] = card
-            name = "lovelace_backup_" + str(time.time_ns()) + ".json"
-            path = backup_path(hass, name)
-            record = {"dashboard": args["name"], "before": original,
-                      "old_sha256": digest(original), "new_sha256": digest(updated)}
-            with path.open("x", encoding="utf-8") as handle:
-                json.dump(record, handle, ensure_ascii=False)
+            name = await hass.async_add_executor_job(
+                save_lovelace_change, hass, dashboard, original, updated,
+                {"name": args["name"], "action": "replace"}
+            )
+            if digest(await dashboard.async_load(False)) != args["expected_dashboard_sha256"]:
+                raise ValueError("Dashboard changed during backup creation; refusing write")
             await dashboard.async_save(updated)
             return ToolResult(data={"installed": True, "backup": name,
                                     "dashboard_sha256": digest(updated)})
@@ -2190,6 +2211,8 @@ def save_lovelace_change(hass, dashboard, original, updated, operation):
               "operation": operation["action"]}
     with path.open("x", encoding="utf-8") as handle:
         json.dump(record, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
     return name
 
 
@@ -2205,8 +2228,10 @@ class PrepareLovelaceCardAdd(Tool):
         try:
             args = tool_input.tool_args
             config = await storage(hass, args["name"]).async_load(False)
-            card = load_draft(hass, args["draft_filename"])
-            if digest(config) != args["expected_dashboard_sha256"] or draft_raw_sha256(hass, args["draft_filename"]) != args["expected_draft_sha256"]:
+            card, draft_hash = await hass.async_add_executor_job(
+                load_draft_and_hash, hass, args["draft_filename"]
+            )
+            if digest(config) != args["expected_dashboard_sha256"] or draft_hash != args["expected_draft_sha256"]:
                 raise ValueError("SHA256 mismatch")
             cards = locate(config, args["view_index"], args["card_index"], args.get("section_index"))
             return ToolResult(data={"ready_for_approval": True, "operation": "insert",
@@ -2229,13 +2254,20 @@ class ApplyLovelaceCardAdd(Tool):
             args = tool_input.tool_args
             dashboard = storage(hass, args["name"])
             original = await dashboard.async_load(False)
-            card = load_draft(hass, args["draft_filename"])
-            if digest(original) != args["expected_dashboard_sha256"] or draft_raw_sha256(hass, args["draft_filename"]) != args["expected_draft_sha256"]:
+            card, draft_hash = await hass.async_add_executor_job(
+                load_draft_and_hash, hass, args["draft_filename"]
+            )
+            if digest(original) != args["expected_dashboard_sha256"] or draft_hash != args["expected_draft_sha256"]:
                 raise ValueError("SHA256 mismatch")
             updated = copy.deepcopy(original)
             cards = locate(updated, args["view_index"], args["card_index"], args.get("section_index"))
             cards.insert(args["card_index"], card)
-            backup = save_lovelace_change(hass, dashboard, original, updated, {"name": args["name"], "action": "insert"})
+            backup = await hass.async_add_executor_job(
+                save_lovelace_change, hass, dashboard, original, updated,
+                {"name": args["name"], "action": "insert"}
+            )
+            if digest(await dashboard.async_load(False)) != args["expected_dashboard_sha256"]:
+                raise ValueError("Dashboard changed during backup creation; refusing write")
             await dashboard.async_save(updated)
             return ToolResult(data={"installed": True, "backup": backup, "dashboard_sha256": digest(updated)})
         except (ValueError, OSError, TypeError, KeyError, json.JSONDecodeError) as exc:
@@ -2296,7 +2328,12 @@ class ApplyLovelaceCardDelete(Tool):
             if digest(original) != a["expected_dashboard_sha256"] or digest(cards[a["card_index"]]) != a["expected_card_sha256"]:
                 raise ValueError("SHA256 mismatch")
             cards.pop(a["card_index"])
-            backup = save_lovelace_change(hass, dashboard, original, updated, {"name": a["name"], "action": "delete"})
+            backup = await hass.async_add_executor_job(
+                save_lovelace_change, hass, dashboard, original, updated,
+                {"name": a["name"], "action": "delete"}
+            )
+            if digest(await dashboard.async_load(False)) != a["expected_dashboard_sha256"]:
+                raise ValueError("Dashboard changed during backup creation; refusing write")
             await dashboard.async_save(updated)
             return ToolResult(data={"deleted": True, "backup": backup, "dashboard_sha256": digest(updated)})
         except (ValueError, OSError, TypeError, KeyError) as exc:
@@ -2372,7 +2409,12 @@ class ApplyLovelaceCardMove(Tool):
                 raise ValueError("Dashboard SHA256 mismatch")
             updated = copy.deepcopy(original)
             perform_move(updated, a)
-            backup = save_lovelace_change(hass, dashboard, original, updated, {"name": a["name"], "action": "move"})
+            backup = await hass.async_add_executor_job(
+                save_lovelace_change, hass, dashboard, original, updated,
+                {"name": a["name"], "action": "move"}
+            )
+            if digest(await dashboard.async_load(False)) != a["expected_dashboard_sha256"]:
+                raise ValueError("Dashboard changed during backup creation; refusing write")
             await dashboard.async_save(updated)
             return ToolResult(data={"moved": True, "backup": backup, "dashboard_sha256": digest(updated)})
         except (ValueError, OSError, TypeError, KeyError) as exc:
@@ -2394,7 +2436,9 @@ class RestoreLovelaceCardBackup(Tool):
     async def async_call(self, hass, tool_input, llm_context):
         try:
             args = tool_input.tool_args
-            record = json.loads(backup_path(hass, args["backup"]).read_text(encoding="utf-8"))
+            record = await hass.async_add_executor_job(
+                read_lovelace_backup, hass, args["backup"]
+            )
             dashboard = storage(hass, record["dashboard"])
             current = await dashboard.async_load(False)
             if digest(current) != args["expected_current_sha256"] or digest(current) != record["new_sha256"]:
@@ -2816,6 +2860,108 @@ class EntityRegistryCleanupSafetyAudit(Tool):
 
 
 
+REGISTRY_PLAN_MAX_BYTES = 200_000
+
+
+def _registry_backup_folder(hass):
+    root = Path(hass.config.config_dir) / "dashboard_reader" / "backups"
+    if root.is_symlink():
+        raise ValueError("Unsafe registry backup directory")
+    return root
+
+
+def _write_registry_plan(hass, filename, serialized, expected_sha256):
+    """Persist immutable plan in an executor; reject collisions/tampering."""
+    folder = _registry_backup_folder(hass)
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / filename
+    raw = serialized.encode("utf-8")
+    if (len(raw) > REGISTRY_PLAN_MAX_BYTES or
+            hashlib.sha256(raw).hexdigest() != expected_sha256 or
+            filename != "registry_plan_" + expected_sha256[:16] + ".json"):
+        raise ValueError("Invalid plan hash, size or filename")
+    if target.is_symlink():
+        raise ValueError("Unsafe plan path")
+    if target.exists():
+        if (not target.is_file() or target.stat().st_size > REGISTRY_PLAN_MAX_BYTES
+                or target.read_bytes() != raw):
+            raise ValueError("Existing plan differs from requested plan")
+        return
+    try:
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Another task created the file; do not silently trust its content.
+        if (target.is_symlink() or not target.is_file()
+                or target.stat().st_size > REGISTRY_PLAN_MAX_BYTES
+                or target.read_bytes() != raw):
+            raise ValueError("Concurrent plan collision")
+        return
+    with os.fdopen(fd, "wb") as output:
+        output.write(raw)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def _read_registry_plan_bytes(hass, filename):
+    """Read a small, regular plan file once; executor-only."""
+    folder = _registry_backup_folder(hass)
+    path = folder / filename
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > REGISTRY_PLAN_MAX_BYTES:
+        raise ValueError("Unsafe or missing plan")
+    raw = path.read_bytes()
+    if len(raw) > REGISTRY_PLAN_MAX_BYTES:
+        raise ValueError("Plan exceeds size limit")
+    return raw
+
+
+def _write_registry_cleanup_audit(hass, filename, record):
+    """Create-once, fsynced audit record BEFORE registry modification."""
+    folder = _registry_backup_folder(hass)
+    if not folder.is_dir():
+        raise ValueError("Registry backup folder missing")
+    audit = folder / filename
+    if audit.is_symlink() or audit.exists():
+        raise FileExistsError("Plan already attempted")
+    raw = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+    fd = os.open(str(audit), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as output:
+        output.write(raw)
+        output.flush()
+        os.fsync(output.fileno())
+    return audit.name
+
+
+def _bosch_cleanup_blockers(hass, registry, items):
+    """Main-event-loop ONLY: use live HA registry and platform APIs."""
+    from homeassistant.helpers import entity_platform as ep
+
+    blockers = []
+    for item in items:
+        entity_id = item["entity_id"]
+        entry = registry.async_get(entity_id)
+        state = hass.states.get(entity_id)
+        if (entry is None or entry.unique_id != item["unique_id"]
+                or entry.platform != "bosch_homecom"
+                or entry.platform != item["platform"]
+                or entry.config_entry_id != item["config_entry_id"]
+                or entry.device_id != item["device_id"]):
+            blockers.append({"entity_id": entity_id, "reason": "registry_changed"})
+            continue
+        if (state is None or state.state != "unavailable"
+                or state.attributes.get("restored") is not True):
+            blockers.append({"entity_id": entity_id, "reason": "state_changed"})
+        try:
+            platforms = ep.async_get_platforms(hass, entry.platform)
+            if any(entity_id in p.entities or any(
+                getattr(obj, "entity_id", None) == entity_id
+                for obj in p.entities.values()
+            ) for p in platforms):
+                blockers.append({"entity_id": entity_id, "reason": "runtime_loaded"})
+        except Exception:
+            blockers.append({"entity_id": entity_id, "reason": "runtime_check_failed"})
+    return blockers
+
+
 class PrepareEntityRegistryDeletionPlan(Tool):
     """Persist a reviewed, read-only deletion plan without deleting entities."""
     name = "dashboard_reader__prepare_entity_registry_deletion_plan"
@@ -2904,18 +3050,13 @@ class PrepareEntityRegistryDeletionPlan(Tool):
         }
         serialized = json.dumps(payload, ensure_ascii=False, indent=2)
         digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-        folder = Path(hass.config.config_dir) / "dashboard_reader" / "backups"
-        folder.mkdir(parents=True, exist_ok=True)
         filename = "registry_plan_" + digest[:16] + ".json"
-        target = folder / filename
-        if target.is_symlink():
-            return ToolResult(data={"prepared": False, "error": "Unsafe path"})
-        if not target.exists():
-            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                output.write(serialized)
-                output.flush()
-                os.fsync(output.fileno())
+        try:
+            await hass.async_add_executor_job(
+                _write_registry_plan, hass, filename, serialized, digest
+            )
+        except (OSError, ValueError) as exc:
+            return ToolResult(data={"prepared": False, "error": str(exc)})
         return ToolResult(data={
             "prepared": True,
             "plan_filename": filename,
@@ -2951,11 +3092,12 @@ class VerifyEntityRegistryDeletionPlan(Tool):
         from homeassistant.helpers import entity_platform as ep
 
         args = tool_input.tool_args
-        folder = Path(hass.config.config_dir) / "dashboard_reader" / "backups"
-        path = folder / args["filename"]
-        if not path.is_file() or path.is_symlink():
-            return ToolResult(data={"verified": False, "error": "Plan not found"})
-        raw = path.read_bytes()
+        try:
+            raw = await hass.async_add_executor_job(
+                _read_registry_plan_bytes, hass, args["filename"]
+            )
+        except (OSError, ValueError):
+            return ToolResult(data={"verified": False, "error": "Plan not found or unsafe"})
         digest = hashlib.sha256(raw).hexdigest()
         if digest != args["expected_sha256"] or len(raw) > 200000:
             return ToolResult(data={"verified": False, "error": "Plan hash/size mismatch"})
@@ -3046,11 +3188,12 @@ class ApplyBoschRegistryCleanup(Tool):
             "sensor.kotlownia_bosch_piec_gazowy_hot_water_current_setpoint": "102066859-local_dhw_current_setpoint",
             "sensor.kotlownia_bosch_piec_gazowy_supply_temperature_setpoint": "102066859-local_supply_setpoint",
         }
-        folder = Path(hass.config.config_dir) / "dashboard_reader" / "backups"
-        path = folder / args["filename"]
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 200000:
+        try:
+            raw = await hass.async_add_executor_job(
+                _read_registry_plan_bytes, hass, args["filename"]
+            )
+        except (OSError, ValueError):
             return ToolResult(data={"deleted": [], "error": "Unsafe or missing plan"})
-        raw = path.read_bytes()
         digest = hashlib.sha256(raw).hexdigest()
         if (digest != args["expected_sha256"]
                 or args["filename"] != "registry_plan_" + digest[:16] + ".json"):
@@ -3069,47 +3212,33 @@ class ApplyBoschRegistryCleanup(Tool):
                 or {x.get("entity_id"): x.get("unique_id") for x in items} != expected):
             return ToolResult(data={"deleted": [], "error": "Unexpected plan contents"})
         registry = er.async_get(hass)
-        blockers = []
-        for item in items:
-            entity_id = item["entity_id"]
-            entry = registry.async_get(entity_id)
-            state = hass.states.get(entity_id)
-            if (entry is None or entry.unique_id != item["unique_id"]
-                    or entry.platform != "bosch_homecom"
-                    or entry.platform != item["platform"]
-                    or entry.config_entry_id != item["config_entry_id"]
-                    or entry.device_id != item["device_id"]):
-                blockers.append({"entity_id": entity_id, "reason": "registry_changed"})
-                continue
-            if (state is None or state.state != "unavailable"
-                    or state.attributes.get("restored") is not True):
-                blockers.append({"entity_id": entity_id, "reason": "state_changed"})
-            try:
-                platforms = ep.async_get_platforms(hass, entry.platform)
-                if any(entity_id in p.entities or any(
-                    getattr(obj, "entity_id", None) == entity_id
-                    for obj in p.entities.values()
-                ) for p in platforms):
-                    blockers.append({"entity_id": entity_id, "reason": "runtime_loaded"})
-            except Exception:
-                blockers.append({"entity_id": entity_id, "reason": "runtime_check_failed"})
+        blockers = _bosch_cleanup_blockers(hass, registry, items)
         if blockers:
             return ToolResult(data={"deleted": [], "blockers": blockers})
-        # Durable audit log must exist before the first registry mutation.
-        audit = folder / ("registry_cleanup_audit_" + digest[:16] + ".json")
-        if audit.exists() or audit.is_symlink():
-            return ToolResult(data={"deleted": [], "error": "Plan already attempted"})
+        # The immutable audit file must exist before the first registry change.
+        audit_name = "registry_cleanup_audit_" + digest[:16] + ".json"
         record = {
             "plan_sha256": digest, "created_at": time.time(),
             "backup_confirmed_by_user": True,
             "entities": items, "operation": "entity_registry_only",
             "recorder_purge_requested": False, "status": "started",
         }
-        fd = os.open(str(audit), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as output:
-            json.dump(record, output, ensure_ascii=False, indent=2)
-            output.flush()
-            os.fsync(output.fileno())
+        try:
+            await hass.async_add_executor_job(
+                _write_registry_cleanup_audit, hass, audit_name, record
+            )
+        except FileExistsError:
+            return ToolResult(data={"deleted": [], "error": "Plan already attempted"})
+        except (OSError, ValueError) as exc:
+            return ToolResult(data={"deleted": [], "error": type(exc).__name__})
+        # CRITICAL: the await above allows HA state to change; re-check all
+        # candidate entities after the audit write, with NO await until deletion.
+        blockers = _bosch_cleanup_blockers(hass, registry, items)
+        if blockers:
+            return ToolResult(data={
+                "deleted": [], "blockers": blockers, "audit_file": audit_name,
+                "error": "Registry changed while audit was written; no entities deleted",
+            })
         deleted = []
         try:
             for item in items:
@@ -3118,72 +3247,384 @@ class ApplyBoschRegistryCleanup(Tool):
         except Exception as exc:
             return ToolResult(data={
                 "deleted": deleted, "error": type(exc).__name__,
-                "partial_failure": True, "audit_file": audit.name,
+                "partial_failure": True, "audit_file": audit_name,
                 "recovery": "Use the full Home Assistant backup; do not retry blindly.",
             })
         return ToolResult(data={
             "deleted": deleted, "count": len(deleted),
-            "audit_file": audit.name, "recorder_purge_requested": False,
+            "audit_file": audit_name, "recorder_purge_requested": False,
             "warning": "History was not explicitly purged; verify recorder retention separately.",
         })
 
 
 
 class InspectIntegrationExport(Tool):
+    """Read-only structural credential audit; never return source or values."""
     name = "dashboard_reader__inspect_integration_export"
-    title = "Inspect integration export readiness"
-    description = "Read-only SHA256 inventory and fail-closed credential scan; never returns source text or credentials."
+    title = "Inspect Bosch HomeCom export readiness"
+    description = "Read-only structural secret analysis with file, line and category."
     integration = DOMAIN
     annotations = READ_ONLY
-    parameters = vol.Schema({
-        vol.Optional("integration", default="bosch_homecom"): vol.In(["bosch_homecom"]),
-    })
+    parameters = vol.Schema({})
 
     async def async_call(self, hass, tool_input, llm_context):
-        def run():
-            root = Path(hass.config.config_dir) / "custom_components"
-            target = root / tool_input.tool_args["integration"]
-            if target.is_symlink() or not target.is_dir():
-                return {"ready": False, "error": "Integration missing or symlinked"}
-            skip_dirs = {"__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".venv", "venv"}
-            allowed = {".py", ".json", ".yaml", ".yml"}
-            patterns = (
-                re.compile(rb'(?i)(?:access_token|refresh_token|client_secret|api_key|password|private_key|authorization|passwd)\s*[=:]\s*\S{5,}'),
-                re.compile(rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
-                re.compile(rb'(?i)[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@'),
+        def inspect():
+            import ast
+            import json
+            import yaml
+
+            root = Path(hass.config.config_dir) / "custom_components" / "bosch_homecom"
+            if root.is_symlink() or not root.is_dir():
+                return {"ready": False, "error": "Integration directory unavailable"}
+            ignored = {"__pycache__", ".git", ".pytest_cache", ".mypy_cache"}
+            suffixes = {".py", ".json", ".yaml", ".yml"}
+            secret_name = re.compile(
+                r"(?i)(?:^|_)(?:access_token|refresh_token|client_secret|api_key|"
+                r"password|passwd|private_key|authorization)(?:$|_)"
             )
-            files = []
-            blocked = []
-            skipped = 0
+            private_key = re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")
+            url_userinfo = re.compile(rb"(?i)\\b[a-z][a-z0-9+.-]*://[^\\s/@:]+:[^\\s/@]+@")
+            oauth_name = re.compile(
+                r"(?i)^(?:client_id|scope|grant_type|token_url|authorization_url|"
+                r"redirect_uri|oauth_url)$"
+            )
+            files, findings, blocked = [], [], []
+            seen = set()
             total = 0
-            for path in sorted(target.rglob("*")):
-                relative = path.relative_to(target)
-                if any(p in skip_dirs for p in relative.parts):
+
+            def add(name, line, category, blocking):
+                key = (name, line, category)
+                if key not in seen:
+                    seen.add(key)
+                    findings.append({"path": name, "line": line,
+                                     "category": category, "blocking": blocking})
+
+            def classify_python(name, source):
+                try:
+                    tree = ast.parse(source)
+                except (SyntaxError, ValueError, UnicodeError):
+                    blocked.append({"path": name, "reason": "python_parse_failed"})
+                    return
+
+                def value_kind(node):
+                    if isinstance(node, ast.Constant):
+                        return "literal" if isinstance(node.value, (str, bytes)) and bool(node.value) else "other"
+                    if isinstance(node, ast.JoinedStr):
+                        return "constructed"
+                    if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)):
+                        return "reference"
+                    return "computed"
+
+                for node in ast.walk(tree):
+                    pairs = []
+                    if isinstance(node, ast.Assign):
+                        pairs = [(t, node.value) for t in node.targets]
+                    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                        pairs = [(node.target, node.value)]
+                    elif isinstance(node, ast.NamedExpr):
+                        pairs = [(node.target, node.value)]
+                    elif isinstance(node, ast.Call):
+                        # Keyword arguments can pass real credentials or just references.
+                        pairs = [(ast.Name(id=kw.arg, ctx=ast.Load()), kw.value)
+                                 for kw in node.keywords if kw.arg]
+                    elif isinstance(node, ast.Dict):
+                        for key, value in zip(node.keys, node.values):
+                            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                                pairs.append((ast.Name(id=key.value, ctx=ast.Load()), value))
+                    for target, value in pairs:
+                        names = [n.id for n in ast.walk(target) if isinstance(n, ast.Name)]
+                        names += [n.attr for n in ast.walk(target) if isinstance(n, ast.Attribute)]
+                        for field in names:
+                            if secret_name.search(field):
+                                kind = value_kind(value)
+                                # HA CONF_* constants are field-name definitions, not credentials,
+                                # but ONLY when the literal exactly matches the declared key.
+                                is_config_key = (
+                                    field.startswith("CONF_")
+                                    and isinstance(value, ast.Constant)
+                                    and isinstance(value.value, str)
+                                    and value.value == field[5:].lower()
+                                )
+                                if is_config_key:
+                                    add(name, getattr(value, "lineno", node.lineno),
+                                        "configuration_key_constant", False)
+                                    continue
+                                kind = value_kind(value)
+                                if kind == "reference":
+                                    add(name, getattr(value, "lineno", node.lineno),
+                                        "credential_reference", False)
+                                else:
+                                    add(name, getattr(value, "lineno", node.lineno),
+                                        "credential_" + kind, True)
+                            elif oauth_name.fullmatch(field):
+                                add(name, getattr(value, "lineno", node.lineno),
+                                    "oauth_configuration_reference", False)
+
+            def classify_json(name, source):
+                try:
+                    document = json.loads(source)
+                except (ValueError, UnicodeError):
+                    blocked.append({"path": name, "reason": "json_parse_failed"})
+                    return
+                # Translation labels and descriptions are not credentials.
+                is_translation = name == "strings.json" or name.startswith("translations/")
+                if is_translation:
+                    return
+                def walk(obj):
+                    if isinstance(obj, dict):
+                        for key, value in obj.items():
+                            if secret_name.search(key):
+                                # No value is returned; unknown JSON credential values block export.
+                                add(name, 0, "json_credential_field", True)
+                            walk(value)
+                    elif isinstance(obj, list):
+                        for value in obj:
+                            walk(value)
+                walk(document)
+
+            def classify_yaml(name, source):
+                try:
+                    # compose() preserves key source positions without constructing
+                    # Python objects or running arbitrary YAML constructors.
+                    document = yaml.compose(source, Loader=yaml.SafeLoader)
+                except yaml.YAMLError:
+                    blocked.append({"path": name, "reason": "yaml_parse_failed"})
+                    return
+                if document is None:
+                    return
+                visited = set()
+                def walk(node):
+                    if id(node) in visited:
+                        return
+                    visited.add(id(node))
+                    if isinstance(node, yaml.MappingNode):
+                        for key, value in node.value:
+                            if not isinstance(key, yaml.ScalarNode):
+                                blocked.append({"path": name, "reason": "yaml_complex_key"})
+                                continue
+                            field = key.value
+                            if secret_name.search(field):
+                                add(name, key.start_mark.line + 1,
+                                    "yaml_credential_field", True)
+                            walk(value)
+                    elif isinstance(node, yaml.SequenceNode):
+                        for value in node.value:
+                            walk(value)
+                walk(document)
+
+            for path in sorted(root.rglob("*")):
+                rel = path.relative_to(root)
+                name = rel.as_posix()
+                if any(part in ignored for part in rel.parts):
                     continue
                 if path.is_symlink():
-                    blocked.append({"path": relative.as_posix(), "reason": "symlink"})
+                    blocked.append({"path": name, "reason": "symlink"})
                     continue
                 if not path.is_file():
                     continue
-                if path.name.lower() in {"secrets.yaml", "configuration.yaml", ".env"} or path.suffix.lower() not in allowed:
-                    skipped += 1
+                if path.name.lower() in {"secrets.yaml", "configuration.yaml", ".env"}:
+                    blocked.append({"path": name, "reason": "sensitive_filename"})
+                    continue
+                if path.suffix.lower() not in suffixes:
+                    blocked.append({"path": name, "reason": "unsupported_file_type"})
                     continue
                 size = path.stat().st_size
-                if size > 2000000 or total + size > 12000000:
-                    blocked.append({"path": relative.as_posix(), "reason": "size_limit"})
+                if size > 2_000_000 or total + size > 12_000_000:
+                    blocked.append({"path": name, "reason": "size"})
                     continue
-                raw = path.read_bytes()
-                total += len(raw)
-                suspicious = any(pattern.search(raw) for pattern in patterns)
-                if suspicious:
-                    blocked.append({"path": relative.as_posix(), "reason": "possible_credential"})
-                files.append({"path": relative.as_posix(), "bytes": len(raw),
-                              "sha256": hashlib.sha256(raw).hexdigest(), "blocked": suspicious})
-            return {"integration": tool_input.tool_args["integration"],
-                    "ready": bool(files) and not blocked,
-                    "files": files, "blocked": blocked, "skipped": skipped,
-                    "note": "Static scan is not proof that code is free of credentials; no export performed."}
-        return ToolResult(data=await hass.async_add_executor_job(run))
+                data = path.read_bytes()
+                total += len(data)
+                files.append({"path": name, "bytes": len(data),
+                              "sha256": hashlib.sha256(data).hexdigest()})
+                for line_no, line in enumerate(data.splitlines(), 1):
+                    if private_key.search(line):
+                        add(name, line_no, "private_key", True)
+                    if url_userinfo.search(line):
+                        add(name, line_no, "url_credentials", True)
+                if path.suffix.lower() == ".py":
+                    try:
+                        classify_python(name, data.decode("utf-8"))
+                    except (UnicodeDecodeError, RecursionError):
+                        blocked.append({"path": name, "reason": "python_analysis_failed"})
+                elif path.suffix.lower() == ".json":
+                    try:
+                        classify_json(name, data.decode("utf-8"))
+                    except (UnicodeDecodeError, RecursionError):
+                        blocked.append({"path": name, "reason": "json_analysis_failed"})
+                else:
+                    try:
+                        classify_yaml(name, data.decode("utf-8"))
+                    except (UnicodeDecodeError, RecursionError):
+                        blocked.append({"path": name, "reason": "yaml_analysis_failed"})
+            return {
+                "integration": "bosch_homecom",
+                "ready": bool(files) and not blocked and not any(x["blocking"] for x in findings),
+                "files": files, "findings": findings, "blocked": blocked,
+                "warning": "Heuristic scan; manual review required before export. No export performed."
+            }
+        return ToolResult(data=await hass.async_add_executor_job(inspect))
+
+
+
+
+# Integration patching: exact-context, SHA-gated, approved changes only.
+# Never export complete unredacted source or secrets via these tools.
+PATCH_CONFIRM = "APPLY_APPROVED_INTEGRATION_PATCH"
+PATCH_PATH = re.compile(r"custom_components/[a-z0-9_]+/[a-zA-Z0-9_./-]+\.(?:py|json|yaml|yml)\Z")
+PATCH_MAX_BYTES = 500_000
+
+
+def _patch_target(hass, relative):
+    if not isinstance(relative, str) or not PATCH_PATH.fullmatch(relative):
+        raise ValueError("Invalid integration path")
+    if any(part in (".", "..") or part.startswith(".") for part in relative.split("/")):
+        raise ValueError("Hidden or traversal path")
+    if any(part.lower() in ("secrets.yaml", "configuration.yaml", "auth", "tokens.json")
+           for part in relative.split("/")):
+        raise ValueError("Sensitive path blocked")
+    root = Path(hass.config.config_dir)
+    path = root / relative
+    if any(p.is_symlink() for p in (path, *path.parents) if p != root):
+        raise ValueError("Symlink in path")
+    if not path.is_file() or path.stat().st_size > PATCH_MAX_BYTES:
+        raise ValueError("File missing or too large")
+    return path
+
+
+def _patch_plan_path(hass):
+    root = Path(hass.config.config_dir) / "dashboard_reader" / "patches"
+    if root.is_symlink():
+        raise ValueError("Patch folder symlink")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _build_patch(hass, relative, expected_sha256, old_text, new_text):
+    if (not old_text or len(old_text) > 12000 or len(new_text) > 12000
+            or old_text == new_text):
+        raise ValueError("Invalid patch size or content")
+    # Never allow snippets that look like inline secrets to be supplied to the tool.
+    if (SECRET_VALUES.search(old_text) or SECRET_VALUES.search(new_text)
+            or URL_USERINFO.search(old_text) or URL_USERINFO.search(new_text)):
+        raise ValueError("Patch contains credential-like text")
+    path = _patch_target(hass, relative)
+    raw = path.read_bytes()
+    if _hash_bytes(raw) != expected_sha256:
+        raise ValueError("Source SHA256 mismatch")
+    source = raw.decode("utf-8")
+    if source.count(old_text) != 1:
+        raise ValueError("Expected exactly one matching context")
+    updated = source.replace(old_text, new_text, 1)
+    data = updated.encode("utf-8")
+    if len(data) > PATCH_MAX_BYTES:
+        raise ValueError("Updated file too large")
+    if path.suffix == ".py":
+        compile(updated, str(path), "exec")
+    elif path.suffix == ".json":
+        json.loads(updated)
+    else:
+        yaml.safe_load(updated)
+    return path, raw, data
+
+
+class PrepareIntegrationPatch(Tool):
+    name = "dashboard_reader__prepare_integration_patch"
+    title = "Prepare exact integration code patch"
+    description = ("Stage a unique, exact-text replacement in an existing integration file. "
+                   "Requires original SHA256. Returns hashes, not raw source. "
+                   "Never changes live files.")
+    integration = DOMAIN
+    annotations = EXPORT_ANNOTATIONS
+    parameters = vol.Schema({
+        vol.Required("path"): str,
+        vol.Required("expected_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("old_text"): vol.All(str, vol.Length(min=1, max=12000)),
+        vol.Required("new_text"): vol.All(str, vol.Length(max=12000)),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        def run():
+            path, raw, data = _build_patch(hass, args["path"], args["expected_sha256"],
+                                           args["old_text"], args["new_text"])
+            root = _patch_plan_path(hass)
+            # Store only the change instructions, never whole original file.
+            plan = {"path": args["path"], "expected_sha256": _hash_bytes(raw),
+                    "updated_sha256": _hash_bytes(data),
+                    "old_text": args["old_text"], "new_text": args["new_text"]}
+            serialized = json.dumps(plan, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            plan_sha = _hash_bytes(serialized)
+            target = root / (plan_sha + ".json")
+            if target.is_symlink():
+                raise ValueError("Patch plan symlink")
+            with target.open("xb") as stream:
+                stream.write(serialized)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return {"prepared": True, "path": args["path"],
+                    "source_sha256": _hash_bytes(raw), "updated_sha256": _hash_bytes(data),
+                    "plan_sha256": plan_sha, "requires_approval": True}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError, UnicodeError, SyntaxError, json.JSONDecodeError, yaml.YAMLError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+
+
+class ApplyIntegrationPatch(Tool):
+    name = "dashboard_reader__apply_integration_patch"
+    title = "Apply approved integration patch with backup"
+    description = ("DANGEROUS: Apply a prepared exact-context integration patch. "
+                   "Requires plan SHA256, current file SHA256 and explicit user approval. "
+                   "Creates a unique backup and never restarts HA.")
+    integration = DOMAIN
+    annotations = ToolAnnotations(read_only=False, destructive=True,
+                                  idempotent=False, open_world=False)
+    parameters = vol.Schema({
+        vol.Required("plan_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("expected_live_sha256"): vol.Match(r"[0-9a-f]{64}"),
+        vol.Required("confirmation"): vol.In((PATCH_CONFIRM,)),
+    })
+
+    async def async_call(self, hass, tool_input, llm_context):
+        args = tool_input.tool_args
+        def run():
+            root = _patch_plan_path(hass)
+            plan_path = root / (args["plan_sha256"] + ".json")
+            if plan_path.is_symlink() or not plan_path.is_file():
+                raise ValueError("Patch plan missing")
+            serialized = plan_path.read_bytes()
+            if len(serialized) > 30000 or _hash_bytes(serialized) != args["plan_sha256"]:
+                raise ValueError("Patch plan hash mismatch")
+            plan = json.loads(serialized)
+            if plan["expected_sha256"] != args["expected_live_sha256"]:
+                raise ValueError("Expected source SHA256 mismatch")
+            path, raw, data = _build_patch(hass, plan["path"], plan["expected_sha256"],
+                                           plan["old_text"], plan["new_text"])
+            if _hash_bytes(data) != plan["updated_sha256"]:
+                raise ValueError("Updated content hash mismatch")
+            backup_dir = Path(hass.config.config_dir) / "dashboard_reader" / "backups"
+            if backup_dir.is_symlink():
+                raise ValueError("Backup folder symlink")
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup = backup_dir / ("patch_" + path.parent.name + "_" + path.name + "_" +
+                                   time.strftime("%Y%m%d_%H%M%S", time.gmtime()) + "_" +
+                                   _hash_bytes(raw)[:12] + ".bak")
+            if backup.exists() or backup.is_symlink():
+                raise ValueError("Backup collision")
+            with backup.open("xb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if path.read_bytes() != raw:
+                raise ValueError("Source changed before write")
+            _atomic_update_bytes(path, data)
+            return {"installed": True, "path": plan["path"],
+                    "updated_sha256": _hash_bytes(data), "backup": str(backup),
+                    "note": "Reload or restart integration separately after approval"}
+        try:
+            return ToolResult(data=await hass.async_add_executor_job(run))
+        except (ValueError, OSError, UnicodeError, SyntaxError, json.JSONDecodeError, yaml.YAMLError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
 
 
 @callback
@@ -3206,4 +3647,5 @@ def async_get_tools(hass: HomeAssistant, llm_context: LLMContext,
         CreateTextDraft(), AppendTextDraft(), ReadHAConfig(),
         LLMUpdateStatus(), StageLLMUpdate(), FetchLLMUpdate(), ApplyLLMUpdate(), RestoreLLMBackup(),
         AppendScriptFromDraft(), HAFileStatus(), InstallHADraftFile(), RestartHomeAssistant(),
+        PrepareIntegrationPatch(), ApplyIntegrationPatch(),
     ])
